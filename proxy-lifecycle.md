@@ -654,3 +654,257 @@ UI 中已有明确提示（[proxy.blade.php](file:///d:/fz/0601-1/solo-dogfeedin
         ├─ 兼容模式 → 无需操作，双标签覆盖
         └─ 精确模式 → 需重新部署所有应用以刷新标签
 ```
+
+---
+
+## 11. Traefik certresolver 与 ACME 证书自动化
+
+### 11.1 ACME 配置生成
+
+Traefik 的 Let's Encrypt 配置在 [generateDefaultProxyConfiguration()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/bootstrap/helpers/proxy.php#L316-L318) 中硬编码生成：
+
+```yaml
+command:
+  - '--certificatesresolvers.letsencrypt.acme.httpchallenge=true'
+  - '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=http'
+  - '--certificatesresolvers.letsencrypt.acme.storage=/traefik/acme.json'
+```
+
+关键配置：
+- **挑战类型**：HTTP-01（通过 80 端口验证域名所有权）
+- **证书解析器名称**：`letsencrypt`（全局唯一，所有应用共享）
+- **存储位置**：`/traefik/acme.json`（映射到宿主机 `$proxy_path/acme.json`）
+- **邮件地址**：未在命令中设置，使用 Traefik 默认行为（需要用户在自定义命令中补充 `--certificatesresolvers.letsencrypt.acme.email=your@email.com`）
+
+### 11.2 证书申请触发机制
+
+证书申请完全由标签驱动，触发点在 [fqdnLabelsForTraefik()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/bootstrap/helpers/docker.php#L565-L566)：
+
+```
+应用部署 → generateLabelsApplication()
+  │
+  └─ 对每个 HTTPS 域名：
+        ├─ traefik.http.routers.{name}.tls=true
+        └─ traefik.http.routers.{name}.tls.certresolver=letsencrypt
+```
+
+**触发条件链**：
+1. 应用 FQDN 字段中包含 `https://` 开头的域名
+2. `generateLabelsApplication()` 识别 schema 为 `https`
+3. 生成包含 `tls=true` 和 `tls.certresolver=letsencrypt` 的标签
+4. Traefik 通过 Docker provider 发现新标签
+5. Traefik 自动发起 ACME HTTP-01 挑战
+6. Let's Encrypt 服务器访问 `http://{domain}/.well-known/acme-challenge/{token}` 验证
+7. 验证通过后，Traefik 颁发证书并写入 `acme.json`
+
+**申请时机**：
+- 应用首次部署并启动时（新容器标签出现）
+- 新增 HTTPS 域名并重新部署时
+- 现有证书到期前 30 天（Traefik 自动续期）
+
+### 11.3 证书续期失败时的流量状态
+
+Coolify **不介入**证书续期逻辑，续期完全由 Traefik 内部处理。续期失败的渐进影响：
+
+| 时间点 | 证书状态 | 流量状态 |
+|-------|---------|---------|
+| T0（正常运行） | 有效证书 | ✅ HTTPS 正常，浏览器显示安全锁 |
+| T-30天（到期前30天） | 有效 | ✅ Traefik 开始尝试自动续期 |
+| T-15天 | 仍有效 | ✅ 续期重试中，用户无感知 |
+| T（到期日） | 已过期 | ⚠️ 浏览器显示"不安全"警告，但仍可访问（用户点击"高级"继续） |
+| T+30天 | 过期很久 | ❌ 部分浏览器可能完全阻止访问，返回证书错误 |
+
+**续期失败的常见原因**：
+1. 80 端口被防火墙拦截 → HTTP-01 挑战无法到达
+2. 域名 DNS 解析失效 → Let's Encrypt 无法找到服务器
+3. 服务器 IP 变更 → DNS 记录未同步
+4. Cloudflare 代理开启且 SSL 模式设置不当 → 干扰挑战
+5. `acme.json` 文件权限错误（必须 600）
+
+**Coolify 的缺失环节**：代码中没有对 `acme.json` 有效性、证书到期时间、续期失败日志的监控。用户需要：
+- 手动检查 Traefik 日志：`docker logs coolify-proxy | grep acme`
+- 或在自定义命令中添加 `--log.level=WARN` 以暴露续期错误
+
+---
+
+## 12. ConnectProxyToNetworksJob 每小时补连判定逻辑
+
+### 12.1 调度判定链路
+
+补连机制的核心在 [PushServerUpdateJob::updateProxyStatus()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/PushServerUpdateJob.php#L682-L688)：
+
+```
+PushServerUpdateJob（Sentinel 推送）
+  │
+  └─ updateProxyStatus()
+        ├─ 代理存在且运行中？
+        │
+        └─ 检查缓存键 connect-proxy:{server_id}
+              ├─ 缓存存在 → 跳过（静默退出）
+              └─ 缓存不存在 →
+                    ├─ Cache::put(key, true, 3600)  ← TTL 1小时
+                    └─ ConnectProxyToNetworksJob::dispatch()
+```
+
+**判定参数**：
+- 默认间隔：3600 秒（1小时），来自 [config/constants.php](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/config/constants.php#L116) 的 `constants.proxy.connect_networks_interval_seconds`
+- 可通过环境变量 `PROXY_CONNECT_NETWORKS_INTERVAL_SECONDS` 覆盖
+- 缓存使用 Laravel 默认缓存驱动（通常是 Redis 或 file）
+- `WithoutOverlapping` 中间件：key 为 `connect-proxy-networks-{uuid}`，60秒过期
+
+### 12.2 "漏网之鱼"网络检测方式
+
+[collectDockerNetworksByServer()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/bootstrap/helpers/proxy.php#L40-L106) 是漏网检测的核心，全量收集以下网络：
+
+```
+应连接网络集合 =
+  ├─ Standalone Docker 网络（server.standaloneDockers）
+  ├─ Swarm 网络（server.swarmDockers）
+  ├─ 运行中 Service 的网络（$service->networks()）
+  ├─ 运行中 Compose 应用的网络（$app->uuid）
+  └─ 运行中 Preview 部署的网络（{$app_uuid}-{$pr_id}）
+```
+
+然后与 [collectProxyDockerNetworksByServer()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/bootstrap/helpers/proxy.php#L25-L39) 获取的**实际已连接网络**对比？
+
+**答案：不对比**。代码不做差集计算，而是直接对所有"应连接网络"执行幂等连接命令：
+
+```
+docker network connect {network} coolify-proxy >/dev/null 2>&1 || true
+```
+
+- `>/dev/null 2>&1`：静默所有输出
+- `|| true`：即使已连接（Docker 会报错 `network is already connected`）也不中断命令链
+
+**漏网之鱼捕获场景**：
+1. 代理崩溃重启后丢失网络连接
+2. Swarm 模式下通过 UI 手动添加的新网络
+3. 新部署的应用在 `connectProxyToNetworks()` 执行后才创建网络
+4. 应用删除网络后重建（网络 ID 变更）
+5. Docker daemon 重启导致网络连接状态异常
+
+### 12.3 即时触发 vs 周期补连
+
+| 触发方式 | 场景 | 代码位置 |
+|---------|------|---------|
+| 即时触发（同步） | 应用部署完成时 | [ApplicationDeploymentJob](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/ApplicationDeploymentJob.php#L796) |
+| 即时触发（同步） | 服务启动时 | [StartService](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Service/StartService.php#L44) |
+| 即时触发（同步） | 代理启动完成时 | [StartProxy](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Proxy/StartProxy.php) |
+| 即时触发（同步） | ServerCheckJob 检测到代理运行中 | [ServerCheckJob](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/ServerCheckJob.php#L95) `dispatchSync()` |
+| 周期补连（异步） | PushServerUpdateJob 每小时一次 | [PushServerUpdateJob](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/PushServerUpdateJob.php#L684-L688) |
+
+**补连覆盖的盲区**：即时触发覆盖 99% 的场景，每小时补连是兜底，仅捕获以下边缘情况：
+- 代理崩溃重启后 ServerCheckJob 未及时检测到
+- 应用部署时 `docker network connect` 命令执行失败但未被捕获
+- 底层 Docker 网络状态异常（如 daemon 重启）
+
+---
+
+## 13. CheckProxy 端口冲突检测依据与并行检查界限
+
+### 13.1 端口冲突检测依据
+
+[CheckProxy::handle()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Proxy/CheckProxy.php#L17-L114) 的检测流程：
+
+```
+1. 从 docker-compose.yml 解析待检测端口
+   ├─ TRAEFIK: services.traefik.ports → ["80:80", "443:443", ...]
+   └─ CADDY: services.caddy.ports → ["80:80", "443:443", ...]
+   提取冒号前的宿主端口：[80, 443, 443, 8080] → 去重后 [80, 443, 8080]
+
+2. 对每个端口执行三级降级检测（按优先级）
+   ├─ 第一级：ss 命令（优先）
+   │     ss -Htuln state listening sport = :{port}
+   │     识别 0.0.0.0:{port} 和 :::{port} 双栈
+   │
+   ├─ 第二级：netstat 命令（ss 不可用时）
+   │     netstat -tuln | grep ':{port} '
+   │
+   └─ 第三级：nc 命令（两者都不可用时）
+         nc -z -w1 127.0.0.1 {port}
+
+3. 智能排除非冲突场景
+   ├─ ✅ 端口被 coolify-proxy 自身占用 → 放行
+   ├─ ✅ 端口仅被 docker-proxy 或 coolify 相关进程占用 → 放行
+   ├─ ✅ 标准双栈监听（IPv4+IPv6 各一个）→ 放行
+   └─ ❌ 其他进程占用 → 冲突
+```
+
+**关键检测逻辑**在 [buildPortCheckCommands()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Proxy/CheckProxy.php#L166-L239) 的 Shell 脚本中：
+
+```bash
+# 第一步：先检查是否是 coolify-proxy 自己在用
+CONTAINER_ID=$(docker ps -a --filter name=coolify-proxy --format '{{.ID}}');
+if [ ! -z "$CONTAINER_ID" ]; then
+    if docker inspect $CONTAINER_ID --format '{{json .NetworkSettings.Ports}}' | grep -q '"80/tcp"'; then
+        echo 'proxy_using_port'; exit 0;  # 自身占用，无冲突
+    fi;
+fi;
+
+# 第二步：ss 检测，计数监听条目
+count=$(echo "$ss_output" | grep -c ':80 ');
+if [ $count -le 2 ] && (echo "$ss_output" | grep -q 'docker\|coolify'); then
+    echo 'port_free'; exit 0;  # docker 或 coolify 占用，放行
+fi;
+```
+
+### 13.2 单服务器内并行检查
+
+同一服务器的多个端口使用 [Process::concurrently()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Proxy/CheckProxy.php#L128-L133) 并行检测：
+
+```php
+$results = Process::concurrently(function ($pool) use ($server, $ports, $proxyContainerName) {
+    foreach ($ports as $port) {
+        $commands = $this->buildPortCheckCommands($server, $port, $proxyContainerName);
+        $pool->command($commands['ssh_command'])->timeout(10);
+    }
+});
+```
+
+**并行特性**：
+- 并发级别：Laravel Process 池自动管理，默认与 CPU 核心数相当
+- 单个端口超时：10 秒（`->timeout(10)`）
+- 失败降级：并发检测抛出异常时，自动回退到 [isPortConflict()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Proxy/CheckProxy.php#L285-L416) 的顺序检测
+- 错误处理：单个端口检测失败（进程异常退出）时，假设"无冲突"以避免误报
+
+### 13.3 跨服务器并行检查界限
+
+跨服务器的"并行"**不使用 Process::concurrently**，而是通过队列分发实现异步并行：
+
+```
+ServerManagerJob（每分钟运行一次，单进程）
+  │
+  ├─ getServers() → 获取所有服务器集合
+  │
+  ├─ dispatchConnectionChecks()
+  │     └─ 对每个服务器：ServerConnectionCheckJob::dispatch($server)
+  │           ↳ 全部进入队列，由 Horizon 多进程并行消费
+  │
+  └─ processScheduledTasks()
+        └─ 对每个服务器顺序遍历：
+              └─ processServerTasks($server)
+                    └─ 条件满足时：ServerCheckJob::dispatch($server)
+                          ↳ 同样进入队列并行消费
+```
+
+**并行界限总结表**：
+
+| 层面 | 并行方式 | 并发控制 | 超时 | 代码位置 |
+|-----|---------|---------|------|---------|
+| 单服务器多端口 | Process::concurrently() 同步并行 | 进程池自动管理 | 每个端口 10s | [CheckProxy.php L128](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Proxy/CheckProxy.php#L128) |
+| 多服务器 | 队列 Job 异步并行 | Horizon worker 数量决定 | 每个 Job 60s | [ServerManagerJob.php L83-L100](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/ServerManagerJob.php#L83-L100) |
+| 同一服务器多 Job | WithoutOverlapping 中间件 | keyed by server uuid，60s 过期 | - | [ConnectProxyToNetworksJob.php L33](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/ConnectProxyToNetworksJob.php#L33) |
+
+**跨服务器并行的天然瓶颈**：
+- `dispatchConnectionChecks()` 是 `$servers->each()` 顺序遍历，1000 台服务器需要遍历完才全部入队
+- 但入队后由 Horizon 多 worker 真正并行执行 SSH 检查
+- Sentinel 健康的服务器跳过 SSH 检查，进一步提升效率
+
+### 13.4 检测结果的行为差异
+
+| 检测结果 | fromUI=true（用户手动启动） | fromUI=false（自动恢复） |
+|---------|----------------------------|-------------------------|
+| 有端口冲突 | throw Exception 展示给用户 | 静默 return false，不启动 |
+| 无端口冲突 | return true，继续启动流程 | return true，继续启动流程 |
+| Cloudflare Tunnel 模式 | - | return false，不启动代理 |
+| 代理已 running | return false，不重复启动 | return false，不重复启动 |
