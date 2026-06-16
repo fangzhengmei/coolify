@@ -70,133 +70,327 @@ Job 启动后，通过 `switch ($type)` 路由到不同事件处理器：
 
 ---
 
-### 路径 3：外部事件 → 本地状态映射规则
+## 三、三大事件源对照：字段变更与 subscriptionEnded 触发
 
-#### 3.1 订阅状态映射（Stripe → 本地）
+### 3.1 invoice.paid — 发票支付成功事件
 
-**核心映射逻辑在 [StripeProcessJob.php:108-136](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L108-L136) 和 [StripeProcessJob.php:278-315](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L278-L315)**
+**代码位置**：[StripeProcessJob.php:87-149](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L87-L149)
 
-| Stripe 状态 | 本地字段更新 | 说明 |
-|------------|-------------|------|
-| `active` | `stripe_invoice_paid = true`<br>`stripe_past_due = false` | 正常有效 |
-| `past_due` | `stripe_invoice_paid = true`<br>`stripe_past_due = true` | 逾期但仍保留服务 |
-| `paused` | `stripe_invoice_paid = false` | 暂停，服务不可用 |
-| `incomplete_expired` | `stripe_invoice_paid = false` | 支付超时未完成 |
-| `unpaid` | `stripe_invoice_paid = false`<br>→ 调用 `team->subscriptionEnded()` | 未支付，**终止所有服务** |
-| `canceled` | → 调用 `team->subscriptionEnded()` | 已取消，**终止所有服务** |
+**处理步骤与字段变更**：
 
-#### 3.2 套餐数量（服务器限制）映射
-
-**[StripeProcessJob.php:262-271](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L262-L271)**
-
-```php
-if (str($lookup_key)->contains('dynamic')) {
-    $quantity = min(
-        (int) data_get($data, 'items.data.0.quantity', 2),
-        UpdateSubscriptionQuantity::MAX_SERVER_LIMIT // 100
-    );
-    $team->update(['custom_server_limit' => $quantity]);
-    ServerLimitCheckJob::dispatch($team);
-}
+```
+Step 1: 从事件数据提取 customerId → 按 stripe_customer_id 找 Subscription
+Step 2: 若本地有 stripe_subscription_id → 主动调用 Stripe API 拉取最新状态（不依赖事件数据）
+Step 3: 根据 Stripe 真实 status 映射本地字段
+        ┌─────────────┬──────────────────────────────────────────────────┐
+        │ Stripe status│ 本地字段变更                                      │
+        ├─────────────┼──────────────────────────────────────────────────┤
+        │ active      │ stripe_invoice_paid = true                        │
+        │             │ stripe_past_due = false                           │
+        ├─────────────┼──────────────────────────────────────────────────┤
+        │ past_due    │ stripe_invoice_paid = true  ← 注意：仍标记已支付   │
+        │             │ stripe_past_due = true                            │
+        ├─────────────┼──────────────────────────────────────────────────┤
+        │ canceled    │ 仅发内部通知，不更新字段                           │
+        │ incomplete… │                                                    │
+        │ unpaid      │                                                    │
+        ├─────────────┼──────────────────────────────────────────────────┤
+        │ default 其他│ 延迟 20s → VerifyStripeSubscriptionStatusJob 兜底 │
+        └─────────────┴──────────────────────────────────────────────────┘
+Step 4: 若无 stripe_subscription_id → 延迟 20s → VerifyStripeSubscriptionStatusJob
 ```
 
-**映射规则**：
-- 仅当 `lookup_key` 包含 `dynamic` 时才同步数量（动态定价套餐）
-- 数量被限制在 `[2, 100]` 区间（MIN_SERVER_LIMIT → MAX_SERVER_LIMIT）
-- 更新 `custom_server_limit` 字段后，立即触发 `ServerLimitCheckJob` 检查超限
-
-#### 3.3 退款/取消 → 本地状态映射
-
-**[RefundSubscription.php:73-142](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Actions/Stripe/RefundSubscription.php#L73-L142)**
-
-退款流程的本地状态变更顺序：
-1. ✅ 先记录 `stripe_refunded_at = now()`（防重复退款的关键）
-2. ❌ 标记 `stripe_invoice_paid = false`
-3. ❌ 清除其他状态字段
-4. 🔥 调用 `team->subscriptionEnded()` 终止服务
+**⚠️ 重要结论**：`invoice.paid` **不会触发** `subscriptionEnded()`。即使 Stripe 端已 canceled/unpaid，本事件只发通知不动本地状态，等 `customer.subscription.updated/deleted` 事件来处理。
 
 ---
 
-### 路径 4：团队套餐限制生效机制
+### 3.2 customer.subscription.updated — 订阅更新事件（核心）
 
-#### 4.1 服务器限制计算
+**代码位置**：[StripeProcessJob.php:230-323](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L230-L323)
 
-**[Team.php:154-165](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Models/Team.php#L154-L165)**
+**字段变更全景（按代码执行顺序）**：
 
-```php
-public function limits(): Attribute
-{
-    return Attribute::make(
-        get: function () {
-            if (config('constants.coolify.self_hosted') || $this->id === 0) {
-                return 999999999999; // 自托管或根团队无限制
-            }
-            return $this->custom_server_limit ?? 2; // 默认 2 台
-        }
-    );
-}
+```
+Step 1: 订阅记录定位
+        → 优先按 stripe_customer_id 查
+        → 查不到且 status=incomplete_expired → 抛异常
+        → 查不到但有 team_id → firstOrCreate 新记录（stripe_invoice_paid = false）
+
+Step 2: 无条件更新字段 [L272-277]
+        stripe_feedback = cancellation_details.feedback
+        stripe_comment  = cancellation_details.comment
+        stripe_plan_id  = items.data.0.plan.id
+        stripe_cancel_at_period_end = cancel_at_period_end
+
+Step 3: dynamic 套餐数量更新 [L262-271]
+        → lookup_key 包含 'dynamic' 才处理
+        → custom_server_limit = min(quantity, 100)  ← 只有上限 100，无下限检查！
+        → 触发 ServerLimitCheckJob
+
+Step 4: 状态分支（均带 subscription_id 一致性校验）
+        ┌────────────────────┬─────────────────────────────────────────┬────────────────────┐
+        │ Stripe status      │ 本地字段变更（需通过 ID 校验）            │ subscriptionEnded? │
+        ├────────────────────┼─────────────────────────────────────────┼────────────────────┤
+        │ paused             │ stripe_invoice_paid = false             │ ❌ 不触发          │
+        │ incomplete_expired │                                         │                    │
+        ├────────────────────┼─────────────────────────────────────────┼────────────────────┤
+        │ past_due           │ stripe_past_due = true                  │ ❌ 不触发          │
+        ├────────────────────┼─────────────────────────────────────────┼────────────────────┤
+        │ unpaid             │ stripe_invoice_paid = false             │ ✅ 触发            │
+        │                    │                                         │ → 禁用全部服务器  │
+        ├────────────────────┼─────────────────────────────────────────┼────────────────────┤
+        │ active             │ stripe_past_due = false                 │ ❌ 不触发          │
+        │                    │ stripe_invoice_paid = true              │                    │
+        └────────────────────┴─────────────────────────────────────────┴────────────────────┘
 ```
 
-#### 4.2 ServerLimitCheckJob 超限处理
+**⚠️ subscriptionEnded 触发条件**：
+- **仅当 `status === 'unpaid'` 时触发**，通过 `team->subscriptionEnded()` 调用
+- `canceled` 状态不在此事件处理，靠 `customer.subscription.deleted` 事件触发终止
 
-**[ServerLimitCheckJob.php:28-54](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/ServerLimitCheckJob.php#L28-L54)**
+**ID 校验范围**：状态字段变更前必须通过 `$subscription->stripe_subscription_id === $subscriptionId` 校验，涉及 4 处：
+- [L279-283](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L279-L283) - paused / incomplete_expired
+- [L286-291](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L286-L291) - past_due
+- [L294-299](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L294-L299) - unpaid
+- [L309-314](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L309-L314) - active
 
-```php
-$number_of_servers_to_disable = $servers_count - $this->team->limits;
-if ($number_of_servers_to_disable > 0) {
-    // 禁用最新创建的服务器（按 created_at 倒序）
-    $servers->sortbyDesc('created_at')
-        ->take($number_of_servers_to_disable)
-        ->each(function ($server) {
-            $server->forceDisableServer();
-            $this->team->notify(new ForceDisabled($server));
-        });
-} else {
-    // 限额恢复，重新启用被强制禁用的服务器
-    $servers->each(function ($server) {
-        if ($server->isForceDisabled()) {
-            $server->forceEnableServer();
-        }
-    });
-}
-```
+---
 
-#### 4.3 subscriptionEnded 完全终止
+### 3.3 customer.subscription.deleted — 订阅删除事件
 
-**[Team.php:220-243](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Models/Team.php#L220-L243)**
+**代码位置**：[StripeProcessJob.php:324-340](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L324-L340)
 
 ```php
-public function subscriptionEnded()
-{
-    // 1. 清除订阅状态
-    $this->subscription->update([
-        'stripe_subscription_id' => null,
-        'stripe_invoice_paid' => false,
-        // ... 其他字段重置
-    ]);
-    // 2. 禁用所有服务器
-    foreach ($this->servers as $server) {
-        $server->settings()->update([
-            'is_usable' => false,
-            'is_reachable' => false,
-        ]);
-        ServerReachabilityChanged::dispatch($server);
+$subscription = Subscription::where('stripe_customer_id', $customerId)
+    ->where('stripe_subscription_id', $subscriptionId)  // ← 双条件精确匹配
+    ->first();
+
+if ($subscription) {
+    $team = $subscription->team;
+    if ($team) {
+        $team->subscriptionEnded();  // ✅ 必触发
+    } else {
+        throw new RuntimeException("No team found");
     }
+} else {
+    break;  // 找不到记录静默忽略，不抛异常
 }
 ```
 
+**⚠️ 重要差异**：
+- 此事件 **一定触发** `subscriptionEnded()`（只要 team 存在）
+- ID 校验方式不是松散比较，而是 `WHERE stripe_customer_id AND stripe_subscription_id` **双条件精确匹配**
+- 找不到 subscription 时**静默 break 不抛异常**（与 subscription.updated 的 `throw new RuntimeException` 不同）
+
 ---
 
-## 三、重复回调事件处理机制
+### 3.4 subscriptionEnded 内部字段变更清单
 
-### 3.1 重复回调的产生原因
+**代码位置**：[Team.php:220-243](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Models/Team.php#L220-L243)
+
+触发后分两步执行：
+
+```
+Step 1: Subscription 表字段重置 [L226-232]
+        stripe_subscription_id      = null      ← 断开关联
+        stripe_cancel_at_period_end = false
+        stripe_invoice_paid         = false     ← 标记无效
+        stripe_trial_already_ended  = false
+        stripe_past_due             = false
+
+Step 2: 所有服务器禁用 [L233-242]
+        server.settings.is_usable    = false
+        server.settings.is_reachable = false
+        → 触发 ServerReachabilityChanged 事件广播
+        → server.unreachable_count = 3（到达阈值）
+        → server.unreachable_notification_sent = true
+```
+
+**⚠️ 注意**：`subscriptionEnded()` 内部**不检查** `custom_server_limit`，也**不更新**该字段。该字段保留历史值，直到新订阅创建后被新的数量覆盖。
+
+---
+
+## 四、套餐数量变更的上下限差异：Webhook vs UpdateSubscriptionQuantity
+
+### 4.1 Webhook 路径（customer.subscription.updated）—— 只有上限，无下限
+
+**代码位置**：[StripeProcessJob.php:262-271](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L262-L271)
+
+```php
+$quantity = min(
+    (int) data_get($data, 'items.data.0.quantity', 2),  // 默认值 2，不是下限！
+    UpdateSubscriptionQuantity::MAX_SERVER_LIMIT        // 100 —— 唯一的限制
+);
+```
+
+**关键分析**：
+- 调用了 `min(quantity, 100)` → **只有上限 100**
+- `data_get(..., 2)` 的 2 是**默认值**（quantity 不存在时取 2），不是下限校验
+- 如果 quantity = 0 或 1，Webhook 路径会**原样写入** `custom_server_limit = 0/1`
+- 只有通过 Team.limits() accessor 读取时才回退到 `?? 2`，数据库存的是异常值
+
+**测试用例佐证**：[StripeProcessJobTest.php:146-189](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/tests/Feature/Subscription/StripeProcessJobTest.php#L146-L189) 只测试了上限（999→100），没有测试下限场景。
+
+---
+
+### 4.2 UpdateSubscriptionQuantity 路径 —— 上下限都有
+
+**代码位置**：[UpdateSubscriptionQuantity.php:119-199](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Actions/Stripe/UpdateSubscriptionQuantity.php#L119-L199)
+
+```php
+// 入口处先检查下限 [L121-123]
+if ($quantity < self::MIN_SERVER_LIMIT) {  // MIN = 2
+    return ['success' => false, 'error' => 'Minimum server limit is 2.'];
+}
+// Stripe API 更新后，Webhook 回调用 min(quantity, 100) 做上限保护
+```
+
+**差异总结表**：
+
+| 检查项 | Webhook 路径 | UpdateSubscriptionQuantity |
+|-------|-------------|---------------------------|
+| 下限 2 | ❌ 无 | ✅ `if ($quantity < 2)` 提前 return |
+| 上限 100 | ✅ `min(quantity, 100)` | ✅ 调用后 Webhook 回调保护 |
+| 默认值 | ✅ quantity 不存在时取 2 | ❌ 由调用方传入 |
+| 测试覆盖 | 仅上限测试 | 上下限都有测试 |
+
+---
+
+## 五、RefundSubscription 四道前置校验全解
+
+**代码位置**：[RefundSubscription.php:24-66](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Actions/Stripe/RefundSubscription.php#L24-L66)
+
+`checkEligibility()` 按顺序执行四道校验，任何一道不通过立即返回 `ineligible`：
+
+```
+前置 1 [L28-30]: stripe_refunded_at 非空？
+         └─ 已退过款 → "A refund has already been processed for this team."
+
+前置 2 [L32-34]: stripe_subscription_id 存在？
+         └─ 没有关联订阅 → "No active subscription found."
+
+前置 3 [L36-38]: stripe_invoice_paid = true？
+         └─ 发票未支付 → "Subscription invoice is not paid."
+
+前置 4 [L40-58]: 调用 Stripe API 检查远程状态
+         ├─ 4a. Stripe 查不到订阅 → "Subscription not found in Stripe."
+         ├─ 4b. status 不在 ['active', 'trialing'] → 状态非有效
+         └─ 4c. 从 start_date 起算超过 30 天窗口 → "The 30-day refund window has expired."
+```
+
+**各前置的详细代码对照**：
+
+**前置 1：refunded_at（数据库级防重）**
+```php
+if ($subscription?->stripe_refunded_at) {
+    return $this->ineligible('A refund has already been processed for this team.');
+}
+```
+- 执行顺序：**第一道**，最轻量（纯本地查询）
+- 数据来源：`subscriptions.stripe_refunded_at` 字段，`datetime` 类型
+- 在 `execute()` 中，调用 Stripe Refund API 后**立即写入**该字段 [L106-110]，即使后续取消订阅失败也已防住重复退款
+
+**前置 2：active/trialing（Stripe 端状态校验）**
+```php
+$stripeSubscription = $this->stripe->subscriptions->retrieve($subscription->stripe_subscription_id);
+if (! in_array($stripeSubscription->status, ['active', 'trialing'])) {
+    return $this->ineligible("Subscription status is '{$stripeSubscription->status}'.");
+}
+```
+- 执行顺序：**第四道**中第 4b 步
+- 只允许 `active`（正常付费）和 `trialing`（试用中）两种状态
+- `past_due` / `canceled` / `unpaid` / `incomplete` 均不允许退款
+
+**前置 3：invoice_paid（本地支付标记）**
+```php
+if (! $subscription->stripe_invoice_paid) {
+    return $this->ineligible('Subscription invoice is not paid.');
+}
+```
+- 执行顺序：**第三道**
+- 对应本地 `subscriptions.stripe_invoice_paid` 布尔字段
+- 与前置 4 的 Stripe 端状态形成**双重校验**：本地 + 远端都确认已支付
+
+**前置 4：30 天窗口（时间窗口）**
+```php
+$startDate = Carbon::createFromTimestamp($stripeSubscription->start_date);
+$daysSinceStart = (int) $startDate->diffInDays(now());
+$daysRemaining = self::REFUND_WINDOW_DAYS - $daysSinceStart; // REFUND_WINDOW_DAYS = 30
+if ($daysRemaining <= 0) {
+    return $this->ineligible('The 30-day refund window has expired.');
+}
+```
+- 执行顺序：**第四道**中第 4c 步
+- 起算时间：Stripe `subscription.start_date`（订阅开始时间，不是首次支付时间）
+- 计算方式：`now() - start_date`，取整天数差
+- 窗口：精确 30 自然日，第 31 天 00:00 起不可退款
+- 返回值还包含 `days_remaining` 供前端展示剩余天数
+
+**四道前置的短路机制**：按顺序校验，前一道失败直接 return，不执行后续校验（避免不必要的 Stripe API 调用）。
+
+---
+
+## 六、ID 校验范围全览
+
+### 6.1 customer.subscription.updated 中的 ID 校验
+
+**校验逻辑**：`$subscription->stripe_subscription_id === $subscriptionId`
+
+**覆盖范围（4 处状态分支）**：
+
+| 状态 | 代码行 | 校验通过时更新 |
+|-----|--------|--------------|
+| `paused` / `incomplete_expired` | [L279-283](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L279-L283) | `stripe_invoice_paid = false` |
+| `past_due` | [L286-291](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L286-L291) | `stripe_past_due = true` |
+| `unpaid` | [L294-299](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L294-L299) | `stripe_invoice_paid = false` + `subscriptionEnded()` |
+| `active` | [L309-314](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L309-L314) | `stripe_past_due = false` + `stripe_invoice_paid = true` |
+
+**⚠️ 不覆盖的范围**：
+- L272-277 的字段更新（`stripe_feedback` / `stripe_comment` / `stripe_plan_id` / `stripe_cancel_at_period_end`）**没有 ID 校验**，直接更新
+- L262-271 的 dynamic 套餐数量更新**没有 ID 校验**，直接更新 team 的 `custom_server_limit`
+- `canceled` 状态本事件不处理，无校验机会
+
+**场景风险**：如果用户新订阅刚创建完成，旧订阅的 `subscription.updated` 延迟事件到达 —— feedback/comment/plan_id/cancel_at_period_end 和 custom_server_limit 会被旧数据覆盖，但状态字段（invoice_paid/past_due）和 subscriptionEnded 不会被触发。
+
+---
+
+### 6.2 customer.subscription.deleted 中的 ID 校验
+
+**校验逻辑**：`WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`
+
+**代码位置**：[L327](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L327)
+
+```php
+$subscription = Subscription::where('stripe_customer_id', $customerId)
+    ->where('stripe_subscription_id', $subscriptionId)
+    ->first();
+```
+
+- 更严格：**双条件精确匹配**，不是先查 customer 再比较 id
+- 找不到时 `break` 静默跳过，不抛异常
+- 找到了才调用 `subscriptionEnded()`
+
+---
+
+### 6.3 ID 校验差异总结
+
+| 事件 | 校验方式 | 覆盖范围 | 不匹配时 |
+|-----|---------|---------|---------|
+| subscription.updated | `===` 松散比较 | 仅 4 个状态分支（invoice_paid/past_due + subscriptionEnded） | 跳过字段更新但仍执行无校验部分（feedback/plan_id/数量） |
+| subscription.deleted | WHERE 双条件精确匹配 | 整个事件逻辑（subscriptionEnded） | 静默 break，什么都不做 |
+
+---
+
+## 七、重复回调事件处理机制
+
+### 7.1 重复回调的产生原因
 
 Stripe Webhook **至少投递一次**（at-least-once delivery），可能因：
 - 网络超时导致 Stripe 未收到 200 响应
 - 同一事件多次投递（通常间隔递增）
 - 多个事件类型描述同一次状态变更
 
-### 3.2 幂等性保障措施
+### 7.2 幂等性保障措施
 
 #### 措施 1：updateOrCreate / firstOrCreate 防重复
 
@@ -234,24 +428,15 @@ if ($subscription?->stripe_refunded_at) {
 - 退款操作**先写入该字段**，再执行 Stripe API 调用
 - 即使后续取消订阅失败，也能防止重复退款
 
-#### 措施 4：订阅 ID 一致性校验
+#### 措施 4：订阅 ID 一致性校验（详见第六章）
 
-**[StripeProcessJob.php:279-283](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L279-L283)**
-
-```php
-if ($subscription->stripe_subscription_id === $subscriptionId) {
-    $subscription->update([/* 状态更新 */]);
-}
-```
-
-- 仅当事件中的订阅 ID 与本地记录一致时才更新
-- 防止旧订阅事件影响新订阅
+通过状态分支前的 ID 一致性比较，防止旧订阅事件误改新订阅的关键状态。
 
 ---
 
-## 四、账单状态竞争条件处理
+## 八、账单状态竞争条件处理
 
-### 4.1 竞争场景分析
+### 8.1 竞争场景分析
 
 **典型竞争时序**：
 ```
@@ -265,14 +450,14 @@ T5: 两个事件几乎同时到达，并发处理
 
 若 `invoice.payment_failed` 后处理，会覆盖 `invoice.paid` 的正确状态。
 
-### 4.2 竞争防护机制
+### 8.2 竞争防护机制
 
 #### 机制 1：支付失败事件的延迟 + 二次校验
 
 **[StripeProcessJob.php:166-187](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L166-L187)**
 
 ```php
-// 1. 先调用 Stripe API 确认支付状态
+// 1. 先调用 Stripe API 确认支付意图状态
 $paymentIntent = $stripe->paymentIntents->retrieve($paymentIntentId);
 if (in_array($paymentIntent->status, ['processing', 'succeeded', 'requires_action'])) {
     break; // 状态已改变，不处理失败
@@ -285,19 +470,19 @@ if (! $subscription->stripe_invoice_paid && $subscription->created_at->diffInMin
 }
 ```
 
-#### 机制 2：SubscriptionInvoiceFailedJob 的三次校验
+#### 机制 2：SubscriptionInvoiceFailedJob 的三道防线
 
 **[SubscriptionInvoiceFailedJob.php:26-64](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/SubscriptionInvoiceFailedJob.php#L26-L64)**
 
-发送失败通知前的三道防线：
-1. ✅ 检查订阅状态是否已变为 `active` 或 `trialing`
-2. ✅ 检查最近 1 小时内是否有已支付发票
-3. ✅ 任何一项通过则自动修正状态并终止流程
+发送失败通知前依次检查：
+1. ✅ 检查订阅状态是否已变为 `active` 或 `trialing` → 是则自动修正并返回
+2. ✅ 检查最近 1 小时内是否有已支付发票 → 有则自动修正并返回
+3. ✅ 两道都没通过才认定为真失败，发送邮件通知
 
 ```php
 if (in_array($stripeSubscription->status, ['active', 'trialing'])) {
     if (! $subscription->stripe_invoice_paid) {
-        $subscription->update(['stripe_invoice_paid' => true]);
+        $subscription->update(['stripe_invoice_paid' => true, 'stripe_past_due' => false]);
     }
     return; // 不发送失败通知
 }
@@ -307,12 +492,11 @@ if (in_array($stripeSubscription->status, ['active', 'trialing'])) {
 
 **[StripeProcessJob.php:108-136](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L108-L136)**
 
-`invoice.paid` 事件处理时，会**主动从 Stripe 拉取最新订阅状态**，而不是依赖事件中的数据：
+`invoice.paid` 事件处理时，**主动从 Stripe 拉取最新订阅状态**，而不是依赖事件数据中的 snapshot：
 ```php
 $stripeSubscription = $stripe->subscriptions->retrieve($subscription->stripe_subscription_id);
-switch ($stripeSubscription->status) { /* 更新本地状态 */ }
+switch ($stripeSubscription->status) { /* 用 Stripe 实时状态更新本地 */ }
 ```
-
 这确保即使事件顺序错乱，也以 Stripe 端真实状态为准。
 
 #### 机制 4：VerifyStripeSubscriptionStatusJob 兜底
@@ -324,8 +508,7 @@ switch ($stripeSubscription->status) { /* 更新本地状态 */ }
 VerifyStripeSubscriptionStatusJob::dispatch($subscription)
     ->delay(now()->addSeconds(20));
 ```
-
-该 Job 会再次从 Stripe 拉取最新状态并同步，确保最终一致性。
+退避策略：`backoff = [10, 30, 60]` 秒，最多重试 3 次。
 
 #### 机制 5：UpdateSubscriptionQuantity 中的支付回滚
 
@@ -334,25 +517,30 @@ VerifyStripeSubscriptionStatusJob::dispatch($subscription)
 用户主动变更套餐数量时，若分摊发票支付失败：
 ```php
 if ($latestInvoice && $latestInvoice->status !== 'paid') {
-    // 1. 回滚 Stripe 订阅数量
-    $this->stripe->subscriptions->update($subscriptionId, [
-        'items' => [['id' => $item->id, 'quantity' => $previousQuantity]],
-        'proration_behavior' => 'none',
-    ]);
-    // 2. 作废未支付发票
+    // 1. 回滚 Stripe 订阅数量到 previousQuantity
+    $this->stripe->subscriptions->update($subscriptionId, [/* 原数量 */, 'proration_behavior' => 'none']);
+    // 2. 作废未支付发票（voidInvoice）
     $this->stripe->invoices->voidInvoice($latestInvoice->id);
     // 3. 不更新本地 custom_server_limit
     return ['success' => false, 'error' => 'Payment failed.'];
 }
 ```
-
-这防止了 Stripe 数量已变更但支付失败，导致本地与远端不一致。
+防止 Stripe 数量已变更但支付失败，导致本地与远端不一致。
 
 ---
 
-## 五、完整同步路径总结
+## 九、完整同步路径总结
 
-### 5.1 订阅创建流程
+### 9.1 三大事件源字段变更对照表
+
+| 事件源 | 触发 subscriptionEnded | 直接更新字段 | 需 ID 校验 |
+|-------|----------------------|-------------|-----------|
+| invoice.paid | ❌ 从不 | stripe_invoice_paid, stripe_past_due | ❌ 无（但主动拉 Stripe） |
+| subscription.updated | ✅ 仅 status=unpaid | stripe_feedback, stripe_comment,<br>stripe_plan_id, stripe_cancel_at_period_end,<br>stripe_invoice_paid, stripe_past_due,<br>custom_server_limit（dynamic） | ✅ 状态字段 4 处<br>❌ 其他字段和数量 |
+| subscription.deleted | ✅ 总是（找到 team） | 无直接字段，全部走 subscriptionEnded() | ✅ WHERE 双条件匹配 |
+| RefundSubscription | ✅ 总是 | stripe_refunded_at, stripe_feedback, stripe_comment,<br>stripe_invoice_paid 等（见 3.4） | ✅ 四道前置校验 |
+
+### 9.2 订阅创建流程
 ```
 checkout.session.completed
     ↓
@@ -361,70 +549,71 @@ Subscription::updateOrCreate(team_id)
     → stripe_past_due = false
 ```
 
-### 5.2 订阅状态变更流程
+### 9.3 订阅状态变更流程
 ```
 customer.subscription.updated
     ↓
-根据 status 映射本地字段
-    ├─ active → stripe_invoice_paid = true
-    ├─ past_due → stripe_past_due = true
-    ├─ unpaid/canceled → team->subscriptionEnded()
-    └─ dynamic 套餐 → 更新 custom_server_limit → ServerLimitCheckJob
+Step 1: 无条件更新 feedback/comment/plan_id/cancel_at_period_end
+Step 2: dynamic 套餐 → custom_server_limit = min(qty, 100) → ServerLimitCheckJob
+Step 3: 按 status 分支（需通过 subscription_id 一致性校验）
+        ├─ active → stripe_invoice_paid = true, stripe_past_due = false
+        ├─ past_due → stripe_past_due = true
+        ├─ paused/incomplete_expired → stripe_invoice_paid = false
+        └─ unpaid → stripe_invoice_paid = false + subscriptionEnded()
 ```
 
-### 5.3 发票支付流程
+### 9.4 发票支付流程
 ```
 invoice.paid
     ↓
-主动调用 Stripe API 获取最新订阅状态
+主动调用 Stripe subscriptions.retrieve 获取最新状态（不信任事件数据）
     ↓
-根据 Stripe 返回的真实状态更新本地
-    ↓
-未知状态 → 延迟 20s → VerifyStripeSubscriptionStatusJob
+    ├─ active/past_due → 更新对应字段
+    ├─ canceled/unpaid/incomplete_expired → 仅发通知，不动作
+    └─ 其他/异常 → 延迟 20s → VerifyStripeSubscriptionStatusJob（3次重试兜底）
 ```
 
-### 5.4 支付失败流程
+### 9.5 退款取消流程
 ```
-invoice.payment_failed
+RefundSubscription::execute(team)
     ↓
-Stripe API 二次确认支付意图状态
-    ├─ 已成功/处理中 → 忽略
-    └─ 确已失败 → 延迟 60s → SubscriptionInvoiceFailedJob
-                                    ↓
-                            再次校验订阅状态和最近发票
-                                ├─ 已恢复 → 自动修正
-                                └─ 确失败 → 发送邮件通知
+checkEligibility() 四道前置（短路式）：
+    1. stripe_refunded_at 为空？
+    2. stripe_subscription_id 存在？
+    3. stripe_invoice_paid = true？
+    4. Stripe status ∈ [active, trialing] 且 start_date 距今 ≤ 30 天？
+    ↓
+1. Stripe refunds.create（退款）
+2. 写入 stripe_refunded_at = now() ← 立即写库防重复
+3. Stripe subscriptions.cancel（取消订阅）
+4. 更新本地状态字段（invoice_paid = false 等）
+5. team->subscriptionEnded() → 清除订阅 + 禁用全部服务器
 ```
 
-### 5.5 退款取消流程
-```
-RefundSubscription::execute()
-    ↓
-1. 检查 stripe_refunded_at（防重复）
-2. 调用 Stripe Refund API
-3. 立即写入 stripe_refunded_at = now()
-4. 调用 Stripe 取消订阅
-5. 更新本地状态 stripe_invoice_paid = false
-6. 调用 team->subscriptionEnded() 禁用所有服务器
-```
-
-### 5.6 用户主动变更套餐数量流程
+### 9.6 用户主动变更套餐数量流程
 ```
 UpdateSubscriptionQuantity::execute(team, quantity)
     ↓
-1. 调用 Stripe 更新订阅数量 + 立即开票
-2. 检查返回的 latest_invoice 状态
-    ├─ paid → 更新 custom_server_limit → ServerLimitCheckJob
-    └─ 未支付 → 回滚 Stripe 数量 + 作废发票 + 返回错误
+前置校验：quantity >= 2（MIN_SERVER_LIMIT）
+前置校验：subscription 存在且 stripe_invoice_paid = true
+    ↓
+1. Stripe subscriptions.update + proration_behavior=always_invoice
+2. 检查 latest_invoice.status
+    ├─ paid → custom_server_limit = quantity → ServerLimitCheckJob
+    └─ 未支付 → 回滚 Stripe 数量 + voidInvoice + 返回错误
+    ↓
+后续：Stripe 会发送 customer.subscription.updated webhook
+    → Webhook 用 min(quantity, 100) 再做一次上限保护
 ```
 
 ---
 
-## 六、关键设计亮点
+## 十、关键设计亮点
 
-1. **最终一致性优先**：多处设计兜底校验，不依赖单次事件顺序
-2. **状态机单向流转**：失败事件不会覆盖已确认的成功状态
-3. **先标记后操作**：退款先写 `stripe_refunded_at` 防重复
-4. **延迟 + 重试**：失败事件延迟处理，给 Stripe 自动重试留窗口
-5. **数量上下限保护**：服务器限制限制在 [2, 100] 区间，防止异常值
-6. **按时间倒序禁用**：超限时先禁用最新服务器，保护用户核心业务
+1. **最终一致性优先**：多处兜底校验 + 延迟重试，不依赖单次事件投递顺序
+2. **状态机单向流转**：失败事件有二次确认机制，不会覆盖已确认的成功状态
+3. **先标记后操作**：退款先写 `stripe_refunded_at` 防重复，即使后续步骤失败也安全
+4. **延迟 + 退避**：支付失败延迟 60 秒，给 Stripe 自动重试留足时间窗口
+5. **上下限保护不对称**：Webhook 路径只设上限（信任 Stripe），用户主动操作加下限（防误输入）
+6. **按时间倒序禁用**：服务器超限时先禁用最新创建的，保护用户的核心业务服务器
+7. **ID 校验分级**：subscriptionEnded/invoice_paid 等破坏性操作强制校验，feedback/comment 等元数据宽松处理
