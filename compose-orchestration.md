@@ -1127,7 +1127,468 @@ if (! $isDatabase && $fqdns instanceof Collection && $fqdns->count() > 0) {
 
 ---
 
-## 十二、关键数据流转图示
+## 十二、代理层路由标签拼装与服务地址变量
+
+### 12.1 标签生成调度入口
+
+在 `applicationParser()` 第三轮解析中，根据服务器代理类型选择标签生成函数：
+
+**关键代码：** [parsers.php:L1330-L1383](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/parsers.php#L1330-L1383)
+
+```php
+switch ($server->proxyType()) {
+    case ProxyTypes::TRAEFIK->value:
+        $serviceLabels = $serviceLabels->merge(fqdnLabelsForTraefik(...));
+        break;
+    case ProxyTypes::CADDY->value:
+        $serviceLabels = $serviceLabels->merge(fqdnLabelsForCaddy(...));
+        break;
+}
+```
+
+**参数传递：**
+- `uuid`：应用/服务 UUID（PR 部署时带后缀）
+- `domains`：`Collection` 逗号分隔域名列表
+- `is_force_https_enabled`：是否强制 HTTPS
+- `onlyPort`：从 `ports_exposes_array` 提取的首个暴露端口
+- `serviceLabels`：从 compose 文件中解析的已有 traefik/caddy 标签
+- `is_gzip_enabled` / `is_stripprefix_enabled`：中间件开关
+- `service_name`：服务名（用于区分同应用多服务路由）
+- `redirect_direction`：www/非 www 重定向方向
+- `is_http_basic_auth_enabled`：HTTP Basic Auth 开关
+
+### 12.2 fqdnLabelsForTraefik：多域名多路由规则生成
+
+**关键代码：** [docker.php:L414-L650](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L414-L650)
+
+#### 12.2.1 多域名遍历机制
+
+Traefik 标签生成函数的核心结构是对每个域名**独立遍历**，为每个域名生成完整的路由规则集：
+
+```php
+foreach ($domains as $loop => $domain) {
+    try {
+        $url = Url::fromString($domain);
+        $host = $url->getHost();
+        $path = $url->getPath();
+        $schema = $url->getScheme();
+        $port = $url->getPort();
+        // 为每个域名独立生成 router 和 service 标签
+    } catch (Throwable) {
+        continue;  // 单个域名解析失败不影响其他域名
+    }
+}
+```
+
+**关键点：**
+- `$loop` 是域名索引（0, 1, 2...），用于标签名的唯一性
+- 每个域名独立处理，一个域名解析失败不影响其他域名
+
+#### 12.2.2 路由标签命名规则
+
+**Router 命名公式：**
+
+```
+{http|https}-{loop_index}-{uuid}[-{service_name}]
+```
+
+| 组件 | 格式 | 示例 |
+|-----|------|------|
+| HTTP Router | `http-{loop}-{uuid}` | `http-0-abc123` |
+| HTTPS Router | `https-{loop}-{uuid}` | `https-0-abc123` |
+| 带 service_name | `http-{loop}-{uuid}-{name}` | `http-0-abc123-web` |
+| Service (有端口) | `https-{loop}-{uuid}` | `https-0-abc123` |
+
+**多域名场景示例（2 个域名）：**
+
+```
+域名1: https://app.example.com   → routers: http-0-abc123, https-0-abc123
+域名2: https://www.example.com   → routers: http-1-abc123, https-1-abc123
+```
+
+#### 12.2.3 HTTPS 路由标签生成
+
+当域名为 `https` 协议时，生成 HTTPS + HTTP 两种路由：
+
+```php
+if ($schema === 'https') {
+    // HTTPS 路由
+    $labels->push("traefik.http.routers.{$https_label}.rule=Host(`{$host}`) && PathPrefix(`{$path}`)");
+    $labels->push("traefik.http.routers.{$https_label}.entryPoints=https");
+    
+    // 端口绑定（如果指定）
+    if ($port) {
+        $labels->push("traefik.http.routers.{$https_label}.service={$https_label}");
+        $labels->push("traefik.http.services.{$https_label}.loadbalancer.server.port=$port");
+    }
+    
+    // 中间件链（路径剥离、gzip、重定向、认证等）
+    if ($path !== '/') {
+        $middlewares = collect([]);
+        if ($is_stripprefix_enabled) {
+            $labels->push("traefik.http.middlewares.{$https_label}-stripprefix.stripprefix.prefixes={$path}");
+            $middlewares->push("{$https_label}-stripprefix");
+        }
+        if ($is_gzip_enabled) $middlewares->push('gzip');
+        // ... 其他中间件
+        if ($middlewares->isNotEmpty()) {
+            $labels->push("traefik.http.routers.{$https_label}.middlewares={$middlewares->join(',')}");
+        }
+    }
+    
+    // SSL 证书绑定
+    $labels->push("traefik.http.routers.{$https_label}.tls=true");
+    $labels->push("traefik.http.routers.{$https_label}.tls.certresolver=letsencrypt");
+    
+    // HTTP 路由（用于重定向到 HTTPS）
+    $labels->push("traefik.http.routers.{$http_label}.rule=Host(`{$host}`) && PathPrefix(`{$path}`)");
+    $labels->push("traefik.http.routers.{$http_label}.entryPoints=http");
+    if ($is_force_https_enabled) {
+        $labels->push("traefik.http.routers.{$http_label}.middlewares=redirect-to-https");
+    }
+}
+```
+
+#### 12.2.4 SSL 证书绑定
+
+每个 HTTPS 路由自动绑定 Let's Encrypt 证书解析器：
+
+```
+traefik.http.routers.https-0-{uuid}.tls=true
+traefik.http.routers.https-0-{uuid}.tls.certresolver=letsencrypt
+```
+
+**多域名证书：** 每个域名独立申请证书，Traefik 通过 router 规则的 `Host()` 匹配自动为每个域名获取对应证书。
+
+#### 12.2.5 中间件链组装
+
+中间件按以下顺序组装（以 HTTPS + 非根路径为例）：
+
+| 顺序 | 中间件 | 条件 | 标签 |
+|-----|--------|------|------|
+| 1 | StripPrefix | `path !== '/'` 且 `is_stripprefix_enabled` | `{label}-stripprefix` |
+| 2 | Gzip | `is_gzip_enabled` | `gzip` |
+| 3 | Ghost redirect | 镜像包含 `ghost` | `redir-ghost-{uuid}` |
+| 4 | www 重定向 | `redirect_direction` 设置 | `{loop}-{uuid}-to-www/non-www` |
+| 5 | Basic Auth | `is_http_basic_auth_enabled` | `http-basic-auth-{uuid}` |
+| 6 | 自定义中间件 | compose labels 中声明 | 从 `coolify.traefik.middleware` 或 `traefik.http.middlewares.*` 提取 |
+
+**中间件链格式：** `traefik.http.routers.{label}.middlewares=mw1,mw2,mw3`
+
+#### 12.2.6 用户自定义中间件提取
+
+从 compose 文件的 labels 中提取用户自定义的 Traefik 中间件：
+
+```php
+$middlewares_from_labels = $serviceLabels->map(function ($item) {
+    if (preg_match('/traefik\.http\.middlewares\.(.*?)(\.|$)/', $item, $matches)) {
+        return $matches[1];
+    }
+    if (preg_match('/coolify\.traefik\.middlewares=(.*)/', $item, $matches)) {
+        return explode(',', $matches[1]);
+    }
+    return null;
+})->flatten()->filter()->unique();
+```
+
+**两种声明方式：**
+1. 标准 Traefik 标签：`traefik.http.middlewares.my-middleware.xxx=yyy`
+2. Coolify 快捷方式：`coolify.traefik.middleware=mw1,mw2`
+
+### 12.3 fqdnLabelsForCaddy：多域名多站点生成
+
+**关键代码：** [docker.php:L356-L412](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L356-L412)
+
+#### 12.3.1 Caddy 标签结构
+
+Caddy 标签结构与 Traefik 不同，使用数组索引式的路径结构：
+
+```
+caddy_{loop}={schema}://{host}
+caddy_{loop}.header=-Server
+caddy_{loop}.try_files={path} /index.html /index.php
+caddy_{loop}.{handle}.{loop}_reverse_proxy={{upstreams [$port]}}
+caddy_{loop}.{handle}={path}*
+```
+
+#### 12.3.2 多域名遍历
+
+```php
+foreach ($domains as $loop => $domain) {
+    $url = Url::fromString($domain);
+    $host = $url->getHost();
+    $path = $url->getPath();
+    $schema = $url->getScheme();
+    $port = $url->getPort();
+    
+    $handle = 'handle_path';
+    if (! $is_stripprefix_enabled) {
+        $handle = 'handle';
+    }
+    
+    $labels->push("caddy_{$loop}={$schema}://{$host}");
+    $labels->push("caddy_{$loop}.header=-Server");
+    $labels->push("caddy_{$loop}.try_files={path} /index.html /index.php");
+    
+    if ($port) {
+        $labels->push("caddy_{$loop}.{$handle}.{$loop}_reverse_proxy={{upstreams $port}}");
+    } else {
+        $labels->push("caddy_{$loop}.{$handle}.{$loop}_reverse_proxy={{upstreams}}");
+    }
+    $labels->push("caddy_{$loop}.{$handle}={$path}*");
+    
+    if ($is_gzip_enabled) {
+        $labels->push("caddy_{$loop}.encode=zstd gzip");
+    }
+    // 重定向和认证...
+}
+```
+
+#### 12.3.3 Caddy vs Traefik 多域名处理差异
+
+| 维度 | Traefik | Caddy |
+|-----|---------|-------|
+| 路由标识 | 命名 router（`http-{loop}-{uuid}`） | 数组索引（`caddy_{loop}`） |
+| HTTPS 处理 | 显式 tls 标签 + certresolver | Caddy 自动 HTTPS（自动申请证书） |
+| HTTP→HTTPS | 中间件 `redirect-to-https` | Caddy 自动重定向 |
+| 路径处理 | StripPrefix 中间件 | `handle_path`（自动剥离）/ `handle`（保留路径） |
+| 中间件链 | 逗号分隔列表 | 嵌套路径式 |
+| 端口指定 | `loadbalancer.server.port` | `{{upstreams $port}}` |
+| SSL 证书 | `tls.certresolver=letsencrypt` | Caddy 内置自动证书管理 |
+
+#### 12.3.4 Caddy SSL 证书
+
+Caddy 通过 `caddy_{loop}={schema}://{host}` 标签自动识别域名并申请证书。无需额外配置证书解析器，Caddy 内置了 ACME 证书管理。
+
+### 12.4 服务地址变量与代理标签的协作
+
+#### 12.4.1 代理标签注入到 compose 的时机
+
+标签在 `applicationParser()` 第三轮解析中生成，注入到每个服务的 `labels` 字段：
+
+```php
+// parsers.php:L1310-L1320
+$serviceLabels = $labels->merge($defaultLabels);
+// 根据代理类型添加路由标签
+$serviceLabels = $serviceLabels->merge(fqdnLabelsForTraefik/Caddy(...));
+// 写入 compose payload
+$payload['labels'] = $serviceLabels->toArray();
+```
+
+#### 12.4.2 COOLIFY_URL/FQDN 与代理标签的域源一致性
+
+`COOLIFY_URL` / `COOLIFY_FQDN` 的值与代理标签中的域名来自**同一个 fqdn 集合**，确保服务内部获取的访问地址与外部代理路由指向的地址一致。
+
+```php
+// parsers.php:L1268-L1277
+// 代理标签和 COOLIFY_URL/FQDN 使用相同的 $fqdns 集合
+if (! $isDatabase && $fqdns instanceof Collection && $fqdns->count() > 0) {
+    $coolifyEnvironments->put('COOLIFY_URL', $fqdnsWithoutPort->implode(','));
+    $coolifyEnvironments->put('COOLIFY_FQDN', $urls->implode(','));
+}
+// 同一个 $fqdns 也传递给 fqdnLabelsForTraefik/Caddy
+```
+
+#### 12.4.3 预览部署标签的 UUID 隔离
+
+预览部署时，代理标签中的 UUID 会添加 PR 后缀，确保与主部署的路由规则不冲突：
+
+```php
+// parsers.php:L1322-L1329
+$labelUuid = $resource->uuid;
+$labelNetwork = data_get($resource, 'destination.network');
+if ($isPullRequest) {
+    $labelUuid = "{$resource->uuid}-{$pullRequestId}";
+}
+if ($isPullRequest) {
+    $labelNetwork = "{$resource->destination->network}-{$pullRequestId}";
+}
+```
+
+---
+
+## 十三、isDeployable 部署守卫机制
+
+### 13.1 两种 isDeployable 的语义差异
+
+Coolify 中存在两个 `isDeployable`，分别用于不同的资源类型和场景：
+
+| 资源类型 | 方法 | 语义 | 代码位置 |
+|---------|------|------|---------|
+| **Application** | `isDeployable(): bool` | 检查自动部署开关（`is_auto_deploy_enabled`） | [Application.php:L1106-L1113](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/Application.php#L1106-L1113) |
+| **Service** | `isDeployable(): Attribute` | 检查必填环境变量是否已填写 | [Service.php:L1622-L1636](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/Service.php#L1622-L1636) |
+
+### 13.2 Application::isDeployable()
+
+**语义：** 该应用是否允许通过 Webhook 自动触发部署
+
+```php
+// Application.php:L1106-L1113
+public function isDeployable(): bool
+{
+    if ($this->settings->is_auto_deploy_enabled) {
+        return true;
+    }
+    return false;
+}
+```
+
+**使用场景：** Webhook 控制器中判断是否响应该 push 事件
+
+```php
+// Github.php:L133
+if ($application->isDeployable()) {
+    // 入队 ApplicationDeploymentJob
+}
+```
+
+**影响范围：**
+- `true` → Webhook push 事件会触发自动部署
+- `false` → Webhook push 事件被忽略，但手动部署不受影响
+
+**入队逻辑链路（以 GitHub Webhook 为例）：**
+
+```
+GitHub Push Event
+    ↓
+Github.php:133  if ($application->isDeployable())
+    ↓ true
+$application->parse();  // 解析 compose
+    ↓
+ApplicationDeploymentQueue::create([...]);  // 创建部署队列记录
+    ↓
+ApplicationDeploymentJob::dispatch(...);  // 入队实际部署 Job
+```
+
+### 13.3 Service::isDeployable()
+
+**语义：** 该 Service 的所有必填环境变量是否已填写
+
+```php
+// Service.php:L1622-L1636
+protected function isDeployable(): Attribute
+{
+    return Attribute::make(
+        get: function () {
+            $envs = $this->environment_variables()->where('is_required', true)->get();
+            foreach ($envs as $env) {
+                if ($env->is_really_required) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    );
+}
+```
+
+**判断逻辑：**
+
+```
+遍历所有 is_required=true 的环境变量
+    ↓
+对每个变量调用 is_really_required
+    ↓
+is_really_required = is_required && real_value 为空
+    ↓
+任一变量 is_really_required = true → isDeployable = false
+```
+
+### 13.4 is_really_required 计算逻辑
+
+**关键代码：** [EnvironmentVariable.php:L212-L217](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/EnvironmentVariable.php#L212-L217)
+
+```php
+protected function isReallyRequired(): Attribute
+{
+    return Attribute::make(
+        get: fn () => $this->is_required && str($this->real_value)->isEmpty(),
+    );
+}
+```
+
+**判定规则：**
+- `is_required = false` → 不是必填，`is_really_required = false`
+- `is_required = true` 且 `real_value` 非空 → 已填写，`is_really_required = false`
+- `is_required = true` 且 `real_value` 为空 → 未填写，`is_really_required = true`
+
+**`real_value` 的计算：** [EnvironmentVariable.php:L195-L210](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/EnvironmentVariable.php#L195-L210)
+
+`real_value` 会按优先级解析：值本身 → 共享变量查找 → 构建包控制变量。
+
+### 13.5 UI 部署按钮禁用状态
+
+#### 13.5.1 Service 部署按钮
+
+**关键代码：** [heading.blade.php:L32-L212](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/resources/views/livewire/project/service/heading.blade.php#L32-L212)
+
+**isDeployable = true 时：** 显示正常的部署操作按钮
+
+```blade
+@if ($service->isDeployable)
+    <!-- 显示 Deploy / Restart / Stop 等操作按钮 -->
+    <div class="order-first flex flex-wrap items-center gap-2 sm:order-last">
+        <!-- 根据服务状态显示不同操作 -->
+    </div>
+```
+
+**isDeployable = false 时：** 替换为错误提示
+
+```blade
+@else
+    <div class="flex flex-wrap order-first gap-2 items-center sm:order-last">
+        <div class="text-error">
+            Unable to deploy. <a class="underline font-bold cursor-pointer"
+                href="{{ route('project.service.environment-variables', $parameters) }}">
+                Required environment variables missing.</a>
+        </div>
+    </div>
+@endif
+```
+
+**UI 效果：**
+- 部署/重启/停止按钮**完全隐藏**
+- 显示红色错误信息："Unable to deploy. Required environment variables missing."
+- 提供指向环境变量配置页面的链接
+
+#### 13.5.2 环境变量输入框的状态指示
+
+在环境变量编辑界面中，必填且未填写的变量会显示视觉警告（红色边框 `border-error`），帮助用户快速定位缺失的变量。
+
+### 13.6 部署守卫的完整链路
+
+```
+compose 解析
+    ↓
+环境变量创建（is_required 标记）
+    ↓
+用户填写 / 未填写变量
+    ↓
+is_really_required 计算
+    ↓                    ↓
+is_really_required=false  is_really_required=true
+    ↓                      ↓
+isDeployable=true         isDeployable=false
+    ↓                      ↓
+UI: 显示部署按钮          UI: 显示错误提示 + 隐藏按钮
+    ↓                      ↓
+手动部署 → 入队 Job       手动部署 → 不可用
+Webhook → isDeployable()  Webhook → 请求被忽略
+    ↓
+ApplicationDeploymentJob 执行
+```
+
+### 13.7 Application::isDeployable() 与 Service::isDeployable() 的协作
+
+对于使用 docker-compose 构建包的 Application：
+
+- `Application::isDeployable()` 只控制 **Webhook 自动部署**，手动部署不受其影响
+- Service 类型的 `isDeployable()` 控制 **UI 部署按钮的显示**和**手动部署的可用性**
+- Application 类型没有 Service 那样的必填变量检查部署守卫，其 `isDeployable()` 语义完全不同
+
+---
+
+## 十四、关键数据流转图示
 
 ```
 docker-compose.yml 输入
