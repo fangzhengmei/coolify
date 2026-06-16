@@ -28,6 +28,194 @@ Stripe 平台 → Webhook 签名验证 → StripeProcessJob（队列）→ 状�
 
 ---
 
+## 一·附、Webhook 入口与 StripeProcessJob 配置
+
+### 附 1：Webhook 控制器 — 双 catch 返回 400 + 审计日志
+
+**代码位置**：[Stripe.php:14-36](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Http/Controllers/Webhook/Stripe.php#L14-L36)
+
+```php
+public function events(Request $request)
+{
+    try {
+        $webhookSecret = config('subscription.stripe_webhook_secret');
+        $signature = $request->header('Stripe-Signature');
+        $event = Webhook::constructEvent(
+            $request->getContent(),
+            $signature,
+            $webhookSecret
+        );
+        StripeProcessJob::dispatch($event);
+
+        return response('Webhook received. Cool cool cool cool cool.', 200);
+    } catch (SignatureVerificationException $e) {
+        auditLogWebhookFailure('stripe', 'invalid_signature', [
+            'error' => $e->getMessage(),
+        ]);                          // ← 审计日志：签名验证失败
+        return response($e->getMessage(), 400);  // ← 400，触发 Stripe 重试
+    } catch (Exception $e) {
+        return response($e->getMessage(), 400);  // ← 400，其他异常也触发重试
+    }
+}
+```
+
+**两条 catch 的差异**：
+
+| 异常类型 | HTTP 响应 | 审计日志 | Stripe 重试行为 |
+|---------|----------|---------|---------------|
+| `SignatureVerificationException` | 400 | ✅ `auditLogWebhookFailure('stripe', 'invalid_signature', ...)` | 会重试（可能伪造请求，审计用于事后排查） |
+| `Exception`（通用） | 400 | ❌ 无 | 会重试（构造事件失败等异常） |
+
+**⚠️ 关键点**：返回 400 会触发 Stripe 重试机制。如果异常是暂时性的（如 Stripe SDK 版本问题），重试可能成功；如果是持久性的（如 payload 格式错误），Stripe 会在多次重试失败后停止。
+
+---
+
+### 附 2：StripeProcessJob 配置 — tries=3 + ShouldBeEncrypted
+
+**代码位置**：[StripeProcessJob.php:14-27](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L14-L27)
+
+```php
+class StripeProcessJob implements ShouldBeEncrypted, ShouldQueue
+{
+    use Queueable;
+
+    public $type;
+    public $webhook;
+    public $tries = 3;
+```
+
+| 配置项 | 值 | 含义 |
+|-------|-----|------|
+| `ShouldBeEncrypted` | 接口 | 队列中 event 数据加密存储，防止 webhook payload 泄露（含 Stripe 签名等敏感数据） |
+| `ShouldQueue` | 接口 | 异步队列执行，不阻塞 HTTP 响应 |
+| `$tries = 3` | 属性 | 最多重试 3 次（与 VerifyJob 相同，但 SyncJob 为 1） |
+| `$onQueue('high')` | 构造函数 | 高优先级队列，优先于普通 Job 处理 |
+
+---
+
+### 附 3：excludedPlans — invoice.paid 与 subscription.updated 的顶跳过门
+
+**代码位置**：[StripeProcessJob.php:32](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L32)（全局读取）
+
+`$excludedPlans` 在 handle() 入口处从配置读取，仅在两个 case 中使用：
+
+**invoice.paid 中的跳过门**：[StripeProcessJob.php:91-95](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L91-L95)
+```php
+$planId = data_get($data, 'lines.data.0.plan.id');
+if (Str::contains($excludedPlans, $planId)) {
+    break;  // ← 排除套餐的发票，直接跳过不处理
+}
+```
+
+**subscription.updated 中的跳过门**：[StripeProcessJob.php:236-240](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/StripeProcessJob.php#L236-L240)
+```php
+$planId = data_get($data, 'items.data.0.plan.id') ?? data_get($data, 'plan.id');
+if (Str::contains($excludedPlans, $planId)) {
+    break;  // ← 排除套餐的订阅更新，直接跳过不处理
+}
+```
+
+**跳过行为对比**：
+
+| 事件 | planId 提取路径 | 跳过后行为 | 影响 |
+|-----|---------------|----------|------|
+| invoice.paid | `lines.data.0.plan.id` | `break` → 完全忽略该发票 | 不更新任何本地状态 |
+| subscription.updated | `items.data.0.plan.id ?? plan.id` | `break` → 完全忽略该更新 | 不更新状态、数量、元数据 |
+
+**⚠️ 注意**：
+- `Str::contains` 是**模糊匹配**，如果 `$excludedPlans` 为 `'plan_xxx'`，则 `'plan_xxx_v2'` 也会被匹配
+- 排除套餐的 `subscription.deleted` 事件**不受影响**，仍会正常处理（无跳过门）
+- `checkout.session.completed` 和 `subscription.created` 也**无跳过门**
+
+---
+
+### 附 4：subscriptionEnded 入口空判 early return
+
+**代码位置**：[Team.php:220-224](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Models/Team.php#L220-L224)
+
+```php
+public function subscriptionEnded()
+{
+    if (! $this->subscription) {
+        return;   // ← 没有 subscription 关联时直接返回，不执行后续逻辑
+    }
+
+    $this->subscription->update([/* 字段重置 */]);
+    foreach ($this->servers as $server) {/* 服务器禁用 */}
+}
+```
+
+**影响**：11 处调用点中，如果 team 没有关联 subscription 记录（如从未订阅过的团队），subscriptionEnded 会静默返回，不抛异常、不报错。这意味着：
+- CloudFix 对无订阅记录的团队调用 subscriptionEnded → 静默返回
+- CancelSubscription::cancelById 对本地找不到记录但 team 存在的情况 → 静默返回
+- 任何误调用（如 team 已被清理）都不会报错，但也不会禁用服务器
+
+---
+
+### 附 5：SyncStripeSubscriptionsJob — isCloud/isStripe 预检、tries=1、timeout=1800、fix 二步
+
+**代码位置**：[SyncStripeSubscriptionsJob.php:13-101](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/SyncStripeSubscriptionsJob.php#L13-L101)
+
+**Job 配置**：
+
+```php
+class SyncStripeSubscriptionsJob implements ShouldBeEncrypted, ShouldQueue
+{
+    public int $tries = 1;       // ← 不重试！与 StripeProcessJob(3) 和 VerifyJob(3) 不同
+    public int $timeout = 1800;  // ← 30 分钟超时（批量遍历所有订阅需要较长时间）
+
+    public function __construct(public bool $fix = false)
+    {
+        $this->onQueue('high');
+    }
+```
+
+| 配置项 | 值 | 与其他 Job 对比 |
+|-------|-----|--------------|
+| `$tries` | **1**（不重试） | StripeProcessJob=3, VerifyJob=3 |
+| `$timeout` | **1800s**（30 分钟） | 默认 60s（批量 API 调用需长时间） |
+| `$fix` | 构造参数 | false=仅检测，true=检测+修复 |
+
+**isCloud/isStripe 预检**：[SyncStripeSubscriptionsJob.php:28-30](file:///d:/fz/0601-1/solo-dogfeeding/code/100-coolify/app/Jobs/SyncStripeSubscriptionsJob.php#L28-L30)
+
+```php
+if (! isCloud() || ! isStripe()) {
+    return ['error' => 'Not running on Cloud or Stripe not configured'];
+}
+```
+
+- `isCloud()`：检查是否为 Cloud 部署模式（非自托管）
+- `isStripe()`：检查是否配置了 Stripe 支付
+- 任一不满足直接返回错误数组，不执行同步
+
+**fix 二步流程**（$fix=true 时）：
+
+```
+Step 1: 批量拉取 Stripe 端所有 active + past_due 订阅 ID
+        → fetchValidStripeSubscriptionIds() 使用 autoPagingIterator 遍历
+        → 每次 API 调用间隔 100ms（usleep(100000)）
+
+Step 2: 逐条比对本地 subscription 记录
+        → 本地有 stripe_subscription_id 且 stripe_invoice_paid=true
+        → 但 Stripe 端不在有效集合中 → 标记为 stale
+        ↓
+        对每个 stale 订阅：
+        a. 调 Stripe API 获取确切状态
+        b. findActiveSubscriptionByEmail() 检查是否重新订阅
+           → 同一 email 的不同 customer 下有 active/past_due 订阅？
+           → 有 → 加入 resubscribed 列表，不修复
+           → 无 → 加入 discrepancies 列表
+        c. $fix=true 时执行修复：
+           → update stripe_invoice_paid=false, stripe_past_due=false
+           → 如果 stripeStatus === 'canceled' → team->subscriptionEnded()（调用点5）
+        ↓
+        修复后发送内部通知（含 discrepancies 详情）
+```
+
+**⚠️ tries=1 的设计理由**：SyncJob 涉及大量 Stripe API 调用（批量遍历所有订阅 + 逐条 retrieve），重试成本极高且可能因 rate limit 再次失败。因此设计为单次执行，由人工检查输出后决定是否重新调度。
+
+---
+
 ## 二、subscriptionEnded 十一处调用点全景
 
 `subscriptionEnded()` 是终止团队所有服务的核心方法，共 **11 处调用点**，分五类：
@@ -995,4 +1183,62 @@ customer.subscription.deleted webhook → subscriptionEnded()（调用点2）
 invoice.payment_failed
     ↓
 Stripe API 二次确认 paymentIntent.status
-    ├─ ∈ [processing, succeeded, requires_action, requires_confirmation] → break（白名单
+    ├─ ∈ [processing, succeeded, requires_action, requires_confirmation] → break（白名单四项）
+    └─ 确已失败
+        ├─ 新建订阅 < 5 分钟 且 !invoice_paid → delay(60s) → SubscriptionInvoiceFailedJob
+        └─ !invoice_paid（其他情况） → 立即 dispatch → SubscriptionInvoiceFailedJob
+                ↓
+                Job 内三道防线：
+                1. 订阅已变为 active/trialing？→ 自动修正
+                2. 近 1 小时有已支付发票？→ 自动修正
+                3. 真失败 → 发送邮件通知
+```
+
+### 12.7 VerifyJob 兜底流程（customer 反查 + 三 case self-recovery）
+```
+VerifyStripeSubscriptionStatusJob （延迟 20s，tries=3，backoff=[10,30,60]）
+    ↓
+Step 1: customer 反查 self-recovery
+        stripe_subscription_id 为空 且 stripe_customer_id 存在？
+            ├─ 是 → $stripe->subscriptions->all(customer, limit=1) → 回填 subscription_id
+            └─ 否 → 继续
+    ↓
+反查后仍无 subscription_id？→ return 退出
+    ↓
+Step 2: 三 case 处理
+        ┌─ Case 1: active → invoice_paid=true, past_due=false, 同步 cancel_at_period_end
+        ├─ Case 2: past_due → invoice_paid=true, past_due=true, 同步 cancel_at_period_end
+        └─ Case 3: canceled/incomplete_expired/unpaid → invoice_paid=false, past_due=false
+                                                              + subscriptionEnded()（调用点4）
+```
+
+### 12.8 用户主动变更套餐数量流程
+```
+UpdateSubscriptionQuantity::execute(team, quantity)
+    ↓
+前置校验：quantity >= 2（MIN_SERVER_LIMIT）
+前置校验：subscription 存在且 stripe_invoice_paid = true
+    ↓
+1. Stripe subscriptions.update + proration_behavior=always_invoice
+2. 检查 latest_invoice.status
+    ├─ paid → custom_server_limit = quantity → ServerLimitCheckJob
+    └─ 未支付 → 回滚 Stripe 数量 + voidInvoice + 返回错误
+    ↓
+后续：Stripe 发送 customer.subscription.updated webhook
+    → Webhook 用 min(quantity, 100) 再做一次上限保护
+```
+
+---
+
+## 十三、关键设计亮点
+
+1. **最终一致性优先**：多处兜底校验 + 延迟重试 + self-recovery，不依赖单次事件投递顺序
+2. **状态机单向流转**：失败事件有二次确认机制，不会覆盖已确认的成功状态
+3. **先标记后操作**：退款先写 `stripe_refunded_at` 防重复，即使后续步骤失败也安全
+4. **延迟 + 退避**：支付失败延迟 60 秒，给 Stripe 自动重试留足时间窗口
+5. **上下限保护不对称**：Webhook 路径只设上限（信任 Stripe），用户主动操作加下限（防误输入）
+6. **按时间倒序禁用**：服务器超限时先禁用最新创建的，保护用户的核心业务服务器
+7. **ID 校验分级**：subscriptionEnded/invoice_paid 等破坏性操作强制校验，feedback/comment 等元数据宽松处理
+8. **邮件抑制三层防护**：subscriptionEnded 直接打标记 → isReachableChanged 检查标记 → sendNotification 先写标记
+9. **白名单四项保护**：paymentIntent 的 4 种中间状态不视为失败，避免误报
+10. **VerifyJob 双重自愈**：customer 反查回填 subscription_id + 三 case 双向修正本地状态
