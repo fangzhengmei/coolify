@@ -315,30 +315,40 @@ public function validateDockerEngineVersion()
 
 ## 六、接入完成后的状态持久化
 
-**代码位置**: [ValidateAndInstallServerJob](file:///d:/fz/0601-1/solo-dogfeeding/code/93-coolify/app/Jobs/ValidateAndInstallServerJob.php#L163-L192)
+**代码位置**: [ValidateAndInstallServerJob](file:///d:/fz/0601-1/solo-dogfeeding/code/93-coolify/app/Jobs/ValidateAndInstallServerJob.php#L163-L191)
 
-全部校验通过后：
+按代码实际执行顺序（从上到下）：
 
 ```php
-// 1. 标记验证完成
-$this->server->update(['is_validating' => false]);
-
-// 2. 收集服务器元数据（OS、CPU、内存等）
-$this->server->gatherServerMetadata();
-
-// 3. 启动代理（非构建服务器）
+// 1. 启动代理（非构建服务器）
 if (! $this->server->isBuildServer()) {
     $proxyShouldRun = CheckProxy::run($this->server, true);
     if ($proxyShouldRun) {
-        instant_remote_process(ensureProxyNetworksExist(...), ...);
+        // 先同步创建网络，避免异步代理启动时的竞态
+        instant_remote_process(ensureProxyNetworksExist($this->server)->toArray(), $this->server, false);
         StartProxy::dispatch($this->server);
     }
 }
 
-// 4. 广播事件通知 UI 更新
+// 2. 标记验证完成
+$this->server->update(['is_validating' => false]);
+
+// 3. 收集服务器元数据（OS、CPU、内存等）
+$this->server->gatherServerMetadata();
+
+// 4. 刷新模型，获取最新状态
+$this->server->refresh();
+
+// 5. 广播事件通知 UI 更新
 ServerValidated::dispatch($this->server->team_id, $this->server->uuid);
 ServerReachabilityChanged::dispatch($this->server);
 ```
+
+**顺序说明**：
+- 代理启动放在最前面，因为 `StartProxy::dispatch` 是异步队列任务，先派发后继续执行后续步骤
+- `is_validating = false` 在代理启动之后、元数据收集之前置位
+- `gatherServerMetadata()` 内部调用 `$this->update()` 更新 `server_metadata` 字段
+- `refresh()` 确保后续事件广播时使用的是最新数据
 
 ---
 
