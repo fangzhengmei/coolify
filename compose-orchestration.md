@@ -555,7 +555,579 @@ public function parse(bool $isNew = false): Collection
 
 ---
 
-## 七、关键数据流转图示
+## 七、单应用镜像与构建分流
+
+### 7.1 构建与镜像的分流判定逻辑
+
+Coolify 在解析时会根据服务配置中是否存在 `build` 和 `image` 指令来决定镜像的来源：
+
+**分流规则：**
+
+| build 存在 | image 存在 | 行为 |
+|-----------|-----------|------|
+| 否 | 是 | 直接使用指定镜像 |
+| 是 | 是 | 使用用户指定的 image，build 配置保留用于构建 |
+| 是 | 否 | 自动注入 commit hash 作为镜像标签，用于回滚支持 |
+
+**关键代码：** [parsers.php:L1430-L1441](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/parsers.php#L1430-L1441)
+
+```php
+// 注入 commit-based 镜像标签（仅当服务有 build 但无显式 image 时）
+$hasBuild = data_get($service, 'build') !== null;
+$hasImage = data_get($service, 'image') !== null;
+if ($hasBuild && ! $hasImage && $commit) {
+    $imageTag = str($commit)->substr(0, 128)->value();
+    if ($isPullRequest) {
+        $imageTag = "pr-{$pullRequestId}";
+    }
+    $imageRepo = "{$uuid}_{$serviceName}";
+    $payload['image'] = "{$imageRepo}:{$imageTag}";
+}
+```
+
+### 7.2 自动注入镜像的命名规则
+
+**仓库名：** `{应用uuid}_{服务名}`
+**标签：**
+- 普通部署：`{commit hash 前128字符}`
+- PR 预览部署：`pr-{pull_request_id}`
+
+### 7.3 从 Dockerfile 自动检测端口
+
+如果服务使用 `build` 指令，Coolify 会尝试从 Dockerfile 中解析 `EXPOSE` 指令来获取预设端口：
+
+**关键代码：** [docker.php:L200-L216](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L200-L216)
+
+```php
+function get_port_from_dockerfile($dockerfile): ?int
+{
+    $dockerfile_array = explode("\n", $dockerfile);
+    $found_exposed_port = null;
+    foreach ($dockerfile_array as $line) {
+        $line_str = str($line)->trim();
+        if ($line_str->startsWith('EXPOSE')) {
+            $found_exposed_port = $line_str->replace('EXPOSE', '')->trim();
+            break;
+        }
+    }
+    if ($found_exposed_port) {
+        return (int) $found_exposed_port->value();
+    }
+    return null;
+}
+```
+
+---
+
+## 八、容器命名规则详解
+
+### 8.1 基础命名公式
+
+容器名由两部分组成：服务名 + 基础名
+
+```
+{serviceName}-{baseName}
+```
+
+**关键代码：** [parsers.php:L686-L690](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/parsers.php#L686-L690)
+
+```php
+$baseName = generateApplicationContainerName(
+    application: $resource,
+    pull_request_id: $pullRequestId
+);
+$containerName = "$serviceName-$baseName";
+```
+
+### 8.2 基础名生成策略
+
+`generateApplicationContainerName()` 根据部署类型和配置生成不同的基础名：
+
+**关键代码：** [docker.php:L184-L199](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L184-L199)
+
+```php
+function generateApplicationContainerName(Application $application, $pull_request_id = 0)
+{
+    $consistent_container_name = $application->settings->is_consistent_container_name_enabled;
+    $now = now()->format('Hisu');
+    if ($pull_request_id !== 0 && $pull_request_id !== null) {
+        return $application->uuid.'-pr-'.$pull_request_id;
+    } else {
+        if ($consistent_container_name) {
+            return $application->uuid;
+        }
+        return $application->uuid.'-'.$now;
+    }
+}
+```
+
+### 8.3 三种容器命名模式
+
+| 部署类型 | 一致容器名 | 格式 | 示例 |
+|---------|-----------|------|------|
+| 普通部署 | 关闭 | `{service}-{uuid}-{timestamp}` | `web-app-abc123-12345678` |
+| 普通部署 | 开启 | `{service}-{uuid}` | `web-app-abc123` |
+| PR 预览部署 | - | `{service}-{uuid}-pr-{id}` | `web-app-abc123-pr-42` |
+
+**说明：**
+- 时间戳格式：`Hisu`（时分秒微秒），确保每次部署容器名唯一
+- 一致容器名模式下，部署时会先停止旧容器再启动新容器
+- PR 部署始终使用固定格式，不受一致容器名设置影响
+
+### 8.4 SERVICE_NAME 环境变量
+
+Coolify 会为每个 compose 服务生成对应的 `SERVICE_NAME_*` 环境变量，用于服务间通信时引用容器名：
+
+**关键代码：** [shared.php:L3783-L3791](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/shared.php#L3783-L3791)
+
+```php
+function generateDockerComposeServiceName(mixed $services, int $pullRequestId = 0): Collection
+{
+    $collection = collect([]);
+    foreach ($services as $serviceName => $_) {
+        $collection->put(
+            'SERVICE_NAME_'.str($serviceName)->replace('-', '_')->replace('.', '_')->upper(),
+            addPreviewDeploymentSuffix($serviceName, $pullRequestId)
+        );
+    }
+    return $collection;
+}
+```
+
+**变量名转换规则：**
+- 服务名中的 `-` 和 `.` 替换为 `_`
+- 转换为大写
+- 添加 `SERVICE_NAME_` 前缀
+
+**示例：**
+- 服务名 `my-app` → 变量名 `SERVICE_NAME_MY_APP`
+- 服务名 `api.v2` → 变量名 `SERVICE_NAME_API_V2`
+
+---
+
+## 九、预览部署后缀的资源生成
+
+### 9.1 后缀生成核心函数
+
+`addPreviewDeploymentSuffix()` 是预览部署命名的基础工具函数：
+
+**关键代码：** [shared.php:L3778-L3781](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/shared.php#L3778-L3781)
+
+```php
+function addPreviewDeploymentSuffix(string $name, int $pull_request_id = 0): string
+{
+    return ($pull_request_id === 0) ? $name : $name.'-pr-'.$pull_request_id;
+}
+```
+
+### 9.2 应用后缀的资源类型
+
+预览部署后缀 `-pr-{id}` 会应用到以下资源：
+
+| 资源类型 | 普通部署 | 预览部署 | 可配置开关 |
+|---------|---------|---------|-----------|
+| 容器名 | `{service}-{uuid}` | `{service}-{uuid}-pr-{id}` | 否 |
+| 服务名（compose） | `{service}` | `{service}-pr-{id}` | 否 |
+| 网络名 | `{uuid}` | `{uuid}-{id}` | 否 |
+| 命名卷 | `{uuid}_{volume}` | `{uuid}_{volume}-pr-{id}` | 否 |
+| 绑定卷（source） | `{path}` | `{path}-pr-{id}` | 是（默认开启） |
+| 镜像标签 | `{commit}` | `pr-{id}` | 否 |
+| 代理标签 UUID | `{uuid}` | `{uuid}-{id}` | 否 |
+| 代理网络名 | `{network}` | `{network}-{id}` | 否 |
+
+### 9.3 绑定卷后缀的可配置性
+
+对于本地绑定卷（bind mount），可以通过配置控制是否添加预览后缀：
+
+**关键代码：** [parsers.php:L792-L797](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/parsers.php#L792-L797)
+
+```php
+$isPreviewSuffixEnabled = $foundConfig
+    ? (bool) data_get($foundConfig, 'is_preview_suffix_enabled', true)
+    : true;
+if ($isPullRequest && $isPreviewSuffixEnabled) {
+    $source = addPreviewDeploymentSuffix($source, $pull_request_id);
+}
+```
+
+**默认行为：** 开启（`is_preview_suffix_enabled = true`）
+
+### 9.4 预览部署域名生成
+
+预览部署的域名通过 `preview_url_template` 模板生成，支持以下占位符：
+
+- `{{random}}` - 随机 CUID2 字符串
+- `{{domain}}` - 主应用域名的 host 部分
+- `{{pr_id}}` - Pull Request ID
+
+**关键代码：** [ApplicationPreview.php:L168-L181](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/ApplicationPreview.php#L168-L181)
+
+```php
+$url = Url::fromString($domain);
+$template = $this->application->preview_url_template;
+$host = $url->getHost();
+$schema = $url->getScheme();
+$portInt = $url->getPort();
+$port = $portInt !== null ? ':'.$portInt : '';
+$urlPath = $url->getPath();
+$path = ($urlPath !== '' && $urlPath !== '/') ? $urlPath : '';
+$random = new Cuid2;
+$preview_fqdn = str_replace('{{random}}', $random, $template);
+$preview_fqdn = str_replace('{{domain}}', $host, $preview_fqdn);
+$preview_fqdn = str_replace('{{pr_id}}', $this->pull_request_id, $preview_fqdn);
+$preview_fqdn = "$schema://$preview_fqdn{$port}{$path}";
+```
+
+**生成规则：**
+- 保留原始协议（http/https）
+- 保留端口和路径
+- 域名部分通过模板替换生成
+
+### 9.5 预览部署域名继承机制
+
+创建预览部署时，会从主应用继承域名配置：
+
+**关键代码：** [Previews.php:L203](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Livewire/Project/Application/Previews.php#L203)
+
+```php
+'docker_compose_domains' => $this->application->docker_compose_domains,
+```
+
+然后调用 `generate_preview_fqdn_compose()` 为每个服务生成预览域名。
+
+---
+
+## 十、SERVICE_FQDN_* 与 SERVICE_URL_* 魔法变量深层解析
+
+### 10.1 变量名解析规则
+
+`parseServiceEnvironmentVariable()` 函数负责从变量名中提取服务名和端口：
+
+**关键代码：** [services.php:L423-L456](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/services.php#L423-L456)
+
+```php
+function parseServiceEnvironmentVariable(string $key): array
+{
+    $strKey = str($key);
+    $lastSegment = $strKey->afterLast('_')->value();
+    $hasPort = is_numeric($lastSegment) && ctype_digit($lastSegment);
+
+    if ($hasPort) {
+        // 端口特定变量（如 SERVICE_URL_APP_3000）
+        if ($strKey->startsWith('SERVICE_URL_')) {
+            $serviceName = $strKey->after('SERVICE_URL_')->beforeLast('_')->lower()->value();
+        } elseif ($strKey->startsWith('SERVICE_FQDN_')) {
+            $serviceName = $strKey->after('SERVICE_FQDN_')->beforeLast('_')->lower()->value();
+        }
+        $port = $lastSegment;
+    } else {
+        // 基础变量（如 SERVICE_URL_APP）
+        if ($strKey->startsWith('SERVICE_URL_')) {
+            $serviceName = $strKey->after('SERVICE_URL_')->lower()->value();
+        } elseif ($strKey->startsWith('SERVICE_FQDN_')) {
+            $serviceName = $strKey->after('SERVICE_FQDN_')->lower()->value();
+        }
+        $port = null;
+    }
+
+    return [
+        'service_name' => $serviceName,
+        'port' => $port,
+        'has_port' => $hasPort,
+    ];
+}
+```
+
+### 10.2 端口识别逻辑
+
+**端口判定条件：** `is_numeric($lastSegment) && ctype_digit($lastSegment)`
+
+这意味着：
+- 必须是纯数字（无小数点、无科学计数法）
+- `0` 被认为是有效端口
+- `3.14` 或 `1e5` 不被认为是端口
+
+**示例：**
+
+| 变量名 | 服务名 | 端口 | has_port |
+|-------|-------|------|----------|
+| `SERVICE_URL_APP` | `app` | null | false |
+| `SERVICE_URL_APP_3000` | `app` | `3000` | true |
+| `SERVICE_FQDN_MY_API_8080` | `my_api` | `8080` | true |
+| `SERVICE_URL_REDIS_CACHE_6379` | `redis_cache` | `6379` | true |
+| `SERVICE_URL_APP_0` | `app` | `0` | true |
+| `SERVICE_URL_APP_3.14` | `app_3.14` | null | false |
+| `SERVICE_URL_APP_1e5` | `app_1e5` | null | false |
+
+### 10.3 协议判定逻辑
+
+`generateUrl()` 和 `generateFqdn()` 从服务器的 wildcard_domain 配置中提取协议：
+
+**关键代码：** [shared.php:L1001-L1037](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/shared.php#L1001-L1037)
+
+**协议来源优先级：**
+
+1. **自定义 wildcard_domain**（配置了的话）
+2. **sslip 自动域名**（默认回退）
+   - 开发环境：`http://127.0.0.1.sslip.io`
+   - IPv4：`http://{ip}.sslip.io`
+   - IPv6：`http://{ipv6}.sslip.io`（冒号替换为连字符）
+
+**forceHttps 参数：** 当设置为 `true` 时，强制使用 `https` 协议。
+
+### 10.4 FQDN 与 URL 的区别
+
+| 类型 | 格式 | 示例 |
+|-----|------|------|
+| URL | `{scheme}://{host}{path}` | `https://app.example.com/api` |
+| FQDN (v5+) | `{host}{path}` | `app.example.com/api` |
+| FQDN (旧版) | `{scheme}://{host}{path}` | `https://app.example.com/api` |
+
+**版本判定：** [shared.php:L1032-L1034](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/shared.php#L1032-L1034)
+
+```php
+if ($parserVersion >= 5 && version_compare(config('constants.coolify.version'), '4.0.0-beta.420.7', '>=')) {
+    return "{$random}.$host$path";
+}
+```
+
+### 10.5 配对生成机制
+
+无论 compose 模板中写的是 `SERVICE_URL_*` 还是 `SERVICE_FQDN_*`，Coolify 都会**同时创建对应的两个变量**：
+
+**关键代码：** [parsers.php:L577-L601](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/parsers.php#L577-L601)
+
+```php
+// 同时创建 FQDN 和 URL 变量
+$resource->environment_variables()->updateOrCreate([
+    'key' => "SERVICE_FQDN_{$serviceNamePreserved}_{$port}",
+    'resourceable_type' => get_class($resource),
+    'resourceable_id' => $resource->id,
+], [
+    'value' => $fqdnWithPort,
+    'is_build_time' => false,
+    'is_preview' => $isPullRequest,
+]);
+
+$resource->environment_variables()->updateOrCreate([
+    'key' => "SERVICE_URL_{$serviceNamePreserved}_{$port}",
+    // ...
+], [
+    'value' => $urlWithPort,
+    // ...
+]);
+```
+
+**设计意图：** 确保其他服务无论引用 URL 还是 FQDN 形式的变量，都能获得正确的值。
+
+### 10.6 端口特定变量的生成
+
+当检测到端口特定变量时，除了生成基础变量（无端口），还会生成带端口的版本：
+
+**值的格式：**
+- URL 带端口：`{scheme}://{host}:{port}{path}`
+- FQDN 带端口：`{host}:{port}{path}`
+
+---
+
+## 十一、自定义域名优先级与域名记录一致性
+
+### 11.1 docker_compose_domains 数据结构
+
+`docker_compose_domains` 是存储在 Application/ApplicationPreview 模型上的 JSON 字符串，记录每个服务的域名配置：
+
+**结构示例：**
+```json
+{
+  "web": {
+    "domain": "https://web.example.com,https://app.example.com"
+  },
+  "api": {
+    "domain": "https://api.example.com:8080"
+  }
+}
+```
+
+**模型字段位置：**
+- 主应用：[Application.php:L94](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/Application.php#L94)
+- 预览部署：[ApplicationPreview.php:L23](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/ApplicationPreview.php#L23)
+
+### 11.2 域名优先级
+
+域名来源按以下优先级从高到低：
+
+| 优先级 | 来源 | 说明 |
+|-------|------|------|
+| 1 | 用户自定义域名 | 用户在界面上手动设置的域名（最高优先级） |
+| 2 | 自动生成的通配符域名 | 通过服务器 wildcard_domain 自动生成的域名 |
+| 3 | sslip 自动域名 | 服务器 IP 的 sslip.io 域名（最低回退） |
+
+### 11.3 updateCompose：自定义域名同步机制
+
+当用户更新服务的 `fqdn` 时，`updateCompose()` 函数负责将自定义域名同步到 `SERVICE_*` 环境变量中：
+
+**关键代码：** [services.php:L211-L398](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/services.php#L211-L398)
+
+#### 11.3.1 处理流程
+
+```
+用户更新服务 fqdn
+       ↓
+updateCompose() 被调用
+       ↓
+1. 从 compose 模板中提取当前服务直接声明的 SERVICE_* 变量名
+       ↓
+2. 解析变量名，提取服务名和端口
+       ↓
+3. 删除所有旧的 SERVICE_URL_* 和 SERVICE_FQDN_* 变量
+       ↓
+4. 根据用户设置的 fqdn，创建新的变量值
+       ↓
+5. 同时创建 URL 和 FQDN 配对变量（基础版 + 端口特定版）
+```
+
+#### 11.3.2 只更新直接声明的变量
+
+`updateCompose()` 只会更新**当前服务自己声明**的 `SERVICE_*` 变量，不会更新其他服务引用的变量：
+
+**关键代码：** [services.php:L241-L261](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/services.php#L241-L261)
+
+```php
+// DO NOT extract variables that are only referenced with ${VAR_NAME} syntax
+// Those belong to other services and will be updated when THOSE services are updated
+```
+
+**判断标准：**
+- 直接声明：`SERVICE_URL_APP` 或 `SERVICE_URL_APP=value`（变量名作为 key）
+- 引用：`NEXT_PUBLIC_URL=${SERVICE_URL_APP}`（变量在 value 中以 `${}` 引用）
+
+#### 11.3.3 删除旧变量再重建
+
+为确保一致性，先删除所有旧变量，再创建新的：
+
+**关键代码：** [services.php:L313-L325](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/services.php#L313-L325)
+
+```php
+// Delete base variables
+$resource->service->environment_variables()->where('key', "SERVICE_URL_{$serviceName}")->delete();
+$resource->service->environment_variables()->where('key', "SERVICE_FQDN_{$serviceName}")->delete();
+
+// Delete port-specific variables
+foreach ($serviceInfo['ports'] as $port) {
+    $resource->service->environment_variables()->where('key', "SERVICE_URL_{$serviceName}_{$port}")->delete();
+    $resource->service->environment_variables()->where('key', "SERVICE_FQDN_{$serviceName}_{$port}")->delete();
+}
+```
+
+#### 11.3.4 域名值的解析与重组
+
+从用户设置的 fqdn 中解析出协议、主机、端口、路径，然后重组为 URL 和 FQDN：
+
+**关键代码：** [services.php:L327-L343](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/services.php#L327-L343)
+
+```php
+$resourceFqdns = str($resource->fqdn)->explode(',');
+$resourceFqdns = $resourceFqdns->first();  // 只使用第一个域名
+$url = Url::fromString($resourceFqdns);
+$port = $url->getPort();
+$path = $url->getPath();
+
+// URL 值（含协议和主机）
+$urlValue = $url->getScheme().'://'.$url->getHost();
+$urlValue = ($path === '/') ? $urlValue : $urlValue.$path;
+
+// FQDN 值（仅主机，无协议）
+$fqdnHost = $url->getHost();
+$fqdnValue = str($fqdnHost)->after('://');
+if ($path !== '/') {
+    $fqdnValue = $fqdnValue.$path;
+}
+```
+
+**注意：** 当有多个域名时（逗号分隔），只使用第一个域名来生成 `SERVICE_*` 变量的值。
+
+### 11.4 域名记录一致性保证
+
+#### 11.4.1 parse 时的域名同步
+
+在 `applicationParser()` 解析过程中，会检查 `docker_compose_domains` 中是否已存在该服务的域名，如果不存在则添加：
+
+**关键代码：** [parsers.php:L614-L626](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/parsers.php#L614-L626)
+
+```php
+$domains = collect(json_decode(data_get($resource, 'docker_compose_domains'))) ?? collect([]);
+$domainExists = data_get($domains->get($serviceName), 'domain');
+
+// Update domain using URL with port if applicable
+$domainValue = $port ? $urlWithPort : $url;
+
+if (is_null($domainExists)) {
+    $domains->put($serviceName, [
+        'domain' => $domainValue,
+    ]);
+    $resource->docker_compose_domains = $domains->toJson();
+    $resource->save();
+}
+```
+
+**规则：** 只在域名不存在时添加，不覆盖已有的用户自定义域名。
+
+#### 11.4.2 服务删除时的域名清理
+
+当 compose 文件中删除了某个服务时，`docker_compose_domains` 中对应的条目也会被清理：
+
+**关键代码：** [Application.php:L2008-L2035](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/Application.php#L2008-L2035)
+
+```php
+$json = collect(is_array($decoded) ? $decoded : []);
+$normalized = collect();
+foreach ($json as $key => $value) {
+    // 规范化服务名
+}
+// 找出已删除的服务并移除
+$diff = $normalized->keys()->diff($parsedServices->keys());
+$json = $json->filter(function ($value, $key) use ($diff) {
+    return ! in_array($key, $diff);
+});
+```
+
+#### 11.4.3 用户手动修改域名
+
+用户可以通过 UI 手动修改每个服务的域名，修改后：
+1. 更新 `docker_compose_domains` 中的对应条目
+2. 触发 `updateCompose()` 重新生成 `SERVICE_*` 环境变量
+
+**关键代码：** [PreviewsCompose.php:L38-L43](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Livewire/Project/Application/PreviewsCompose.php#L38-L43)
+
+### 11.5 COOLIFY_URL 与 COOLIFY_FQDN 系统变量
+
+除了 `SERVICE_*` 变量，Coolify 还会为每个服务注入自身的访问地址：
+
+**关键代码：** [parsers.php:L1268-L1277](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/parsers.php#L1268-L1277)
+
+```php
+if (! $isDatabase && $fqdns instanceof Collection && $fqdns->count() > 0) {
+    $fqdnsWithoutPort = $fqdns->map(function ($fqdn) {
+        return str($fqdn)->after('://')->before(':')->prepend(str($fqdn)->before('://')->append('://'));
+    });
+    $coolifyEnvironments->put('COOLIFY_URL', $fqdnsWithoutPort->implode(','));
+
+    $urls = $fqdns->map(function ($fqdn) {
+        return str($fqdn)->replace('http://', '')->replace('https://', '')->before(':');
+    });
+    $coolifyEnvironments->put('COOLIFY_FQDN', $urls->implode(','));
+}
+```
+
+**说明：**
+- `COOLIFY_URL`：服务的完整访问 URL（含协议，不含端口）
+- `COOLIFY_FQDN`：服务的域名（不含协议和端口）
+- 多域名时用逗号分隔
+- 数据库服务不注入这些变量
+
+---
+
+## 十二、关键数据流转图示
 
 ```
 docker-compose.yml 输入
