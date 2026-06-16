@@ -1305,20 +1305,125 @@ traefik.http.routers.https-0-{uuid}.tls.certresolver=letsencrypt
 
 **多域名证书：** 每个域名独立申请证书，Traefik 通过 router 规则的 `Host()` 匹配自动为每个域名获取对应证书。
 
-#### 12.2.5 中间件链组装
+#### 12.2.5 中间件链组装（四种场景完整对照表）
 
-中间件按以下顺序组装（以 HTTPS + 非根路径为例）：
+`fqdnLabelsForTraefik` 中有四个独立的中间件组装分支，分别对应：
+1. HTTPS 协议 + 非根路径（`path !== '/'`）
+2. HTTPS 协议 + 根路径（`path === '/'`）
+3. HTTP 协议 + 非根路径（`path !== '/'`）
+4. HTTPS 场景下的 HTTP 路由（仅 `redirect-to-https`）
 
-| 顺序 | 中间件 | 条件 | 标签 |
-|-----|--------|------|------|
-| 1 | StripPrefix | `path !== '/'` 且 `is_stripprefix_enabled` | `{label}-stripprefix` |
-| 2 | Gzip | `is_gzip_enabled` | `gzip` |
-| 3 | Ghost redirect | 镜像包含 `ghost` | `redir-ghost-{uuid}` |
-| 4 | www 重定向 | `redirect_direction` 设置 | `{loop}-{uuid}-to-www/non-www` |
-| 5 | Basic Auth | `is_http_basic_auth_enabled` | `http-basic-auth-{uuid}` |
-| 6 | 自定义中间件 | compose labels 中声明 | 从 `coolify.traefik.middleware` 或 `traefik.http.middlewares.*` 提取 |
+**HTTPS + 非根路径（主分支）** — 中间件最多的场景：
 
-**中间件链格式：** `traefik.http.routers.{label}.middlewares=mw1,mw2,mw3`
+| 顺序 | 中间件 | push 条件 | 标签名 | 代码位置 |
+|-----|--------|----------|--------|---------|
+| 1 | StripPrefix | `$is_stripprefix_enabled` **且** `!str($image)->contains('ghost')` | `{$https_label}-stripprefix` | [docker.php:L510-L513](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L510-L513) |
+| 2 | Gzip | `$is_gzip_enabled` | `gzip` | [docker.php:L514-L516](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L514-L516) |
+| 3 | Ghost redirect | `str($image)->contains('ghost')` | `redir-ghost-{$uuid}` | [docker.php:L517-L519](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L517-L519) |
+| 4 | → non-www | `$redirect_direction === 'non-www'` 且 `str($host)->startsWith('www.')` | `{$loop}-{$uuid}-to-non-www` | [docker.php:L520-L523](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L520-L523) |
+| 5 | → www | `$redirect_direction === 'www'` 且 `!str($host)->startsWith('www.')` | `{$loop}-{$uuid}-to-www` | [docker.php:L524-L527](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L524-L527) |
+| 6 | Basic Auth | `$is_http_basic_auth_enabled` | `http-basic-auth-{$uuid}` | [docker.php:L528-L530](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L528-L530) |
+| 7 | 自定义中间件 | `$middlewares_from_labels` 不为空 | 从 compose labels 提取 | [docker.php:L531-L533](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L531-L533) |
+
+**HTTPS + 根路径（else 分支）** — 跳过路径剥离但保留其他中间件：
+
+| 顺序 | 中间件 | push 条件 | 与非根路径的区别 |
+|-----|--------|----------|----------------|
+| 1 | Gzip | `$is_gzip_enabled` | 相同 |
+| 2 | Ghost redirect | `str($image)->contains('ghost')` | 相同（ghost 重定向在根路径仍生效） |
+| 3 | → non-www | `$redirect_direction === 'non-www'` 且 host 以 www. 开头 | 相同 |
+| 4 | → www | `$redirect_direction === 'www'` 且 host 不以 www. 开头 | 相同 |
+| 5 | Basic Auth | `$is_http_basic_auth_enabled` | 相同 |
+| 6 | 自定义中间件 | `$middlewares_from_labels` 不为空 | 相同 |
+
+**关键区别：** 根路径分支**没有 StripPrefix**（因为没有路径可剥离），但 **ghost redirect 仍然会 push**（因为 ghost 的路径重写逻辑在根路径也需要）。
+
+**关键代码：** [docker.php:L538-L563](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L538-L563)
+
+**HTTP 协议 + 非根路径** — 纯 HTTP 场景下的中间件：
+
+与 HTTPS + 非根路径的中间件链**完全相同**，只是标签使用 `{$http_label}` 而不是 `{$https_label}`。
+
+**关键代码：** [docker.php:L586-L615](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L586-L615)
+
+**HTTPS 场景下的 HTTP 路由** — 最轻量的分支：
+
+HTTPS 场景中，HTTP 路由**只有一个中间件**，只负责重定向到 HTTPS：
+
+| 中间件 | push 条件 | 代码位置 |
+|--------|----------|---------|
+| `redirect-to-https` | `$is_force_https_enabled` | [docker.php:L575-L577](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L575-L577) |
+
+```php
+// HTTPS 场景的 HTTP 路由：只做 redirect-to-https
+if ($is_force_https_enabled) {
+    $labels->push("traefik.http.routers.{$http_label}.middlewares=redirect-to-https");
+}
+```
+
+**注意：** 这个 HTTP 路由没有 gzip、没有 www 重定向、没有 Basic Auth、没有自定义中间件 —— 只有强制 HTTPS 重定向。所有业务中间件都在 HTTPS router 上。
+
+**完整分支结构图示：**
+
+```
+fqdnLabelsForTraefik
+  ├─ 全局定义: gzip, redirect-to-https (函数开头)
+  └─ 遍历每个域名
+      ├─ HTTPS 协议 (schema === 'https')
+      │   ├─ HTTPS router
+      │   │   ├─ 非根路径 (path !== '/'): 7 类中间件
+      │   │   └─ 根路径 (path === '/'): 6 类中间件 (无 StripPrefix)
+      │   ├─ TLS + certresolver (固定)
+      │   └─ HTTP router (仅重定向用)
+      │       └─ 仅 1 个中间件: redirect-to-https (需 is_force_https_enabled)
+      └─ HTTP 协议 (schema !== 'https')
+          └─ HTTP router
+              ├─ 非根路径: 7 类中间件
+              └─ 根路径: 6 类中间件 (无 StripPrefix)
+```
+
+**ghost 与 stripprefix 互斥逻辑详解：**
+
+互斥条件出现在所有 `path !== '/'` 的分支中（HTTPS 和 HTTP 各一处）：
+
+```php
+// 条件：启用了 stripprefix 且 不是 ghost 镜像
+if ($is_stripprefix_enabled && ! str($image)->contains('ghost')) {
+    $labels->push("traefik.http.middlewares.{$https_label}-stripprefix.stripprefix.prefixes={$path}");
+    $middlewares->push("{$https_label}-stripprefix");
+}
+```
+
+**四种组合的行为：**
+
+| is_stripprefix_enabled | 镜像含 ghost | StripPrefix 中间件 | Ghost redirect 中间件 | 说明 |
+|----------------------|-------------|-------------------|---------------------|------|
+| true | 否 | ✅ push | ❌ 不 push | 正常路径剥离场景 |
+| true | 是 | ❌ 不 push | ✅ push | ghost 场景，改用正则重写 |
+| false | 否 | ❌ 不 push | ❌ 不 push | 保留原始路径 |
+| false | 是 | ❌ 不 push | ✅ push | ghost 场景，只做路径重写 |
+
+**设计意图：** Ghost CMS 使用自己的路径系统，如果用 Traefik 的 StripPrefix 会破坏 Ghost 的内部路由。改用 `redir-ghost` 中间件（基于 `redirectregex`）将 `^{path}/(.*)` 重写为 `/$1`，这样 Ghost 能正确感知原始路径。
+
+**ghost redirect 中间件的提前定义：**
+
+`redir-ghost-{$uuid}` 中间件在**域名循环内部、schema 判断之前**就定义了，这样在后面的中间件链中直接引用即可：
+
+**关键代码：** [docker.php:L479-L485](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L479-L485)
+
+```php
+if (str($image)->contains('ghost')) {
+    // Traefik 版本
+    $labels->push("traefik.http.middlewares.redir-ghost-{$uuid}.redirectregex.regex=^{$path}/(.*)");
+    $labels->push("traefik.http.middlewares.redir-ghost-{$uuid}.redirectregex.replacement=/$1");
+    // Caddy 版本（同时生成）
+    $labels->push("caddy_{$loop}.handle_path.{$loop}_redir-ghost-{$uuid}.handler=rewrite");
+    $labels->push("caddy_{$loop}.handle_path.{$loop}_redir-ghost-{$uuid}.rewrite.regexp=^{$path}/(.*)");
+    $labels->push("caddy_{$loop}.handle_path.{$loop}_redir-ghost-{$uuid}.rewrite.replacement=/$1");
+}
+```
+
+**注意：** 这段代码在域名循环的最开头，位于 `try` 块内、schema 判断之前。每个域名都会检查镜像是否含 ghost，如果是则同时生成 Traefik 和 Caddy 两种格式的中间件定义。
 
 #### 12.2.6 用户自定义中间件提取
 
@@ -1633,7 +1738,328 @@ ApplicationDeploymentJob 执行
 
 ---
 
-## 十四、关键数据流转图示
+## 十四、watch_paths 闸口与 deployment_queue helper
+
+### 14.1 Webhook 三层闸口
+
+Webhook 触发部署前需要经过三层闸口检查：
+
+```
+Git Push Webhook 到达
+       ↓
+[闸口 1] Application::isDeployable()
+       ↓ true
+[闸口 2] isWatchPathsTriggered() 或 watch_paths 为空
+       ↓ true
+[闸口 3] 检查 commit 是否包含 [skip cd] / [skip ci]
+       ↓ 通过
+queue_application_deployment() 入队
+```
+
+**关键代码：** [Github.php:L133-L135](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Http/Controllers/Webhook/Github.php#L133-L135)
+
+```php
+if ($application->isDeployable()) {
+    $is_watch_path_triggered = $application->isWatchPathsTriggered($changed_files);
+    if ($is_watch_path_triggered || blank($application->watch_paths)) {
+        // ... 入队部署
+    }
+}
+```
+
+### 14.2 watch_paths 匹配算法
+
+`matchPaths()` 实现了支持否定模式的路径匹配，采用**顺序匹配、最后匹配优先**的策略。
+
+**关键代码：** [Application.php:L2142-L2177](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/Application.php#L2142-L2177)
+
+```php
+public static function matchPaths(Collection $modified_files, ?Collection $watch_paths): Collection
+{
+    if (is_null($watch_paths) || $watch_paths->isEmpty()) {
+        return collect([]);
+    }
+
+    return $modified_files->filter(function ($file) use ($watch_paths) {
+        $shouldInclude = null; // null 表示还没有任何模式匹配
+
+        foreach ($watch_paths as $pattern) {
+            $pattern = trim($pattern);
+            if (empty($pattern)) continue;
+
+            $isExclusion = str_starts_with($pattern, '!');
+            $matchPattern = $isExclusion ? substr($pattern, 1) : $pattern;
+
+            if (self::globMatch($matchPattern, $file)) {
+                $shouldInclude = ! $isExclusion;
+            }
+        }
+
+        // 所有模式都是排除模式且无匹配时，默认包含
+        if ($shouldInclude === null) {
+            $hasInclusionPatterns = $watch_paths->contains(
+                fn ($p) => ! str_starts_with(trim($p), '!')
+            );
+            return ! $hasInclusionPatterns;
+        }
+
+        return $shouldInclude;
+    })->values();
+}
+```
+
+**匹配规则表：**
+
+| 模式类型 | 示例 | 说明 |
+|---------|------|------|
+| 普通模式 | `*.yml`, `src/**/*.php` | 匹配指定文件 |
+| 否定模式 | `!*.md`, `!docs/**` | 排除指定文件 |
+| 仅否定模式 | `!*.md`, `!*.txt` | 无包含模式时，默认包含所有未排除的文件 |
+| 混合模式 | `src/**`, `!*.test.js` | 最后匹配的模式决定结果 |
+
+**匹配优先级：**
+- 模式按顺序处理，**后定义的模式优先级更高**
+- 同一文件被多个模式匹配时，以最后一个匹配的模式为准
+
+### 14.3 globToRegex 通配符转正则表达式
+
+**关键代码：** [Application.php:L2193-L2270](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/Application.php#L2193-L2270)
+
+支持的通配符：
+
+| 通配符 | 含义 | 正则 |
+|-------|------|------|
+| `*` | 匹配任意字符（不包含 `/`） | `[^/]*` |
+| `**` | 匹配任意数量目录 | `.*` |
+| `**/` | 匹配开头的任意目录 | `.*`（自动跳过后面的 `/`） |
+| `?` | 匹配单个字符（不包含 `/`） | `[^/]` |
+| `[abc]` | 字符类 | `[abc]` |
+| `[!abc]` / `[^abc]` | 否定字符类 | `[^abc]` |
+
+### 14.4 isWatchPathsTriggered 判定
+
+**关键代码：** [Application.php:L2282-L2298](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/Application.php#L2282-L2298)
+
+```php
+public function isWatchPathsTriggered(Collection $modified_files): bool
+{
+    if (is_null($this->watch_paths)) {
+        return false;
+    }
+
+    $this->normalizeWatchPaths();  // 规范化，移除空行和前后空格
+
+    $watch_paths = collect(explode("\n", $this->watch_paths));
+
+    if ($watch_paths->isEmpty()) {
+        return false;
+    }
+
+    $matches = $this->matchWatchPaths($modified_files, $watch_paths);
+
+    return $matches->count() > 0;
+}
+```
+
+### 14.5 watch_paths 存储格式
+
+watch_paths 以换行分隔的字符串存储，支持多行输入：
+
+**UI 输入示例：**
+```
+*.yml
+src/**/*.php
+!*.test.js
+!docs/**
+```
+
+**normalizeWatchPaths 规范化处理：**
+- 每行去除前后空格
+- `!` 否定模式保留 `!`，去除后面的空格和前导 `/`
+- 移除空行
+- 保存为 JSON 字符串
+
+**关键代码：** [Application.php:L2096-L2116](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/app/Models/Application.php#L2096-L2116)
+
+### 14.6 deployment_queue() 队列路由 helper
+
+**关键代码：** [shared.php:L612-L625](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/shared.php#L612-L625)
+
+```php
+function deployment_queue(): string
+{
+    return isCloud() ? 'deployments' : 'high';
+}
+```
+
+**队列路由规则：**
+- **Cloud 环境**：使用 `deployments` 专用队列，由独立的 Horizon worker 池处理
+- **自托管环境**：使用 `high` 共享队列
+- **配置依据**：`config('constants.coolify.self_hosted')`，而非 `HORIZON_QUEUES` 环境变量
+- **注意**：Cloud 环境的 worker 必须在 `HORIZON_QUEUES` 中包含 `deployments`，否则 Job 永远不会被处理
+
+### 14.7 queue_application_deployment() 入队流程
+
+**关键代码：** [applications.php:L15-L109](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/applications.php#L15-L109)
+
+完整的入队流程包含四道检查：
+
+```
+queue_application_deployment() 调用
+       ↓
+[检查 1] 服务器部署队列是否已满
+       ↓ 未满（默认限制 25）
+[检查 2] 是否已有相同 commit + PR 的部署在队列中
+       ↓ 无重复 或 force_rebuild=true
+创建 ApplicationDeploymentQueue 记录
+       ↓
+[检查 3] 是否 no_questions_asked（立即执行）
+       ↓ 否
+[检查 4] next_queuable() 是否允许启动
+       ↓ 允许
+更新状态为 IN_PROGRESS
+       ↓
+ApplicationDeploymentJob::dispatch()
+       ↓
+返回到调用方
+```
+
+#### 14.7.1 队列满检查
+
+```php
+$queue_limit = $serverForQueueCheck->settings->deployment_queue_limit ?? 25;
+$queued_count = ApplicationDeploymentQueue::where('server_id', $server_id)
+    ->where('status', ApplicationDeploymentStatus::QUEUED->value)
+    ->count();
+
+if ($queued_count >= $queue_limit) {
+    return [
+        'status' => 'queue_full',
+        'message' => 'Deployment queue is full. Please wait for existing deployments to complete.',
+    ];
+}
+```
+
+#### 14.7.2 重复部署检查
+
+```php
+$existing_deployment = ApplicationDeploymentQueue::where('application_id', $application_id)
+    ->where('commit', $commit)
+    ->where('pull_request_id', $pull_request_id)
+    ->whereIn('status', [IN_PROGRESS, QUEUED])
+    ->first();
+
+if ($existing_deployment && ! $force_rebuild && ! $rollback && ! $no_questions_asked) {
+    return [
+        'status' => 'skipped',
+        'message' => 'Deployment already queued for this commit.',
+        'deployment_uuid' => $existing_deployment->deployment_uuid,
+    ];
+}
+```
+
+#### 14.7.3 next_queuable 并发控制
+
+**关键代码：** [applications.php:L142-L164](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/applications.php#L142-L164)
+
+```php
+function next_queuable(string $server_id, string $application_id, string $commit = 'HEAD', int $pull_request_id = 0): bool
+{
+    // 同一应用 + 同一 PR 不允许并发部署
+    $in_progress = ApplicationDeploymentQueue::where('application_id', $application_id)
+        ->where('pull_request_id', $pull_request_id)
+        ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->exists();
+
+    if ($in_progress) {
+        return false;
+    }
+
+    // 服务器并发构建限制
+    $server = Server::find($server_id);
+    $concurrent_builds = $server->settings->concurrent_builds;
+    $active_deployments = ApplicationDeploymentQueue::where('server_id', $server_id)
+        ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->count();
+
+    if ($active_deployments >= $concurrent_builds) {
+        return false;
+    }
+
+    return true;
+}
+```
+
+**并发规则：**
+- 同一应用的普通部署（`pull_request_id = 0`）之间不允许并发
+- 同一应用的 PR 部署（`pull_request_id > 0`）之间不允许并发
+- 普通部署和 PR 部署**可以**并发运行（因为 `pull_request_id` 不同）
+- 受服务器的 `concurrent_builds` 全局限制
+
+#### 14.7.4 Deployment Job 分发
+
+当检查通过时，Job 通过 `deployment_queue()` helper 路由到正确的队列：
+
+```php
+ApplicationDeploymentJob::dispatch(
+    application_deployment_queue_id: $deployment->id,
+)->onQueue(deployment_queue());
+```
+
+### 14.8 Webhook 到 Job 的完整链路
+
+```
+GitHub/Gitea/GitLab Push Event
+       ↓
+Webhook 控制器解析 changed_files
+       ↓
+┌─────────────────────────────────────────┐
+│ 闸口 1: Application::isDeployable()     │ 检查自动部署开关
+└─────────────────────────────────────────┘
+       ↓ true
+┌─────────────────────────────────────────┐
+│ 闸口 2: isWatchPathsTriggered()         │ 匹配变更文件
+│   - matchPaths() 支持否定模式           │
+│   - 最后匹配优先                        │
+│ 或 watch_paths 为空（全部触发）         │
+└─────────────────────────────────────────┘
+       ↓ true
+┌─────────────────────────────────────────┐
+│ 闸口 3: 检查 [skip cd]/[skip ci]        │ 检查 commit 消息
+└─────────────────────────────────────────┘
+       ↓ 通过
+生成 deployment_uuid (Cuid2)
+       ↓
+queue_application_deployment()
+       ↓
+┌─────────────────────────────────────────┐
+│ 检查 1: 队列是否已满（默认 25）         │
+└─────────────────────────────────────────┘
+       ↓
+┌─────────────────────────────────────────┐
+│ 检查 2: 是否重复部署                    │
+└─────────────────────────────────────────┘
+       ↓
+创建 ApplicationDeploymentQueue 记录
+       ↓
+┌─────────────────────────────────────────┐
+│ 检查 3: next_queuable()                 │
+│   - 同一应用+PR 是否有进行中部署         │
+│   - 服务器并发限制                       │
+└─────────────────────────────────────────┘
+       ↓ 允许
+更新状态为 IN_PROGRESS
+       ↓
+ApplicationDeploymentJob::dispatch()
+       ↓
+onQueue(deployment_queue())
+       ↓
+Worker 执行 Job
+```
+
+---
+
+## 十五、关键数据流转图示
 
 ```
 docker-compose.yml 输入
