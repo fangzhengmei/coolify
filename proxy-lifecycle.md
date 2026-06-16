@@ -783,20 +783,86 @@ docker network connect {network} coolify-proxy >/dev/null 2>&1 || true
 4. 应用删除网络后重建（网络 ID 变更）
 5. Docker daemon 重启导致网络连接状态异常
 
-### 12.3 即时触发 vs 周期补连
+### 12.3 代理网络连接完整触发链
 
-| 触发方式 | 场景 | 代码位置 |
-|---------|------|---------|
-| 即时触发（同步） | 应用部署完成时 | [ApplicationDeploymentJob](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/ApplicationDeploymentJob.php#L796) |
-| 即时触发（同步） | 服务启动时 | [StartService](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Service/StartService.php#L44) |
-| 即时触发（同步） | 代理启动完成时 | [StartProxy](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Proxy/StartProxy.php) |
-| 即时触发（同步） | ServerCheckJob 检测到代理运行中 | [ServerCheckJob](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/ServerCheckJob.php#L95) `dispatchSync()` |
-| 周期补连（异步） | PushServerUpdateJob 每小时一次 | [PushServerUpdateJob](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/PushServerUpdateJob.php#L684-L688) |
+Coolify 中代理网络连接有**两条独立触发链**：链 A 通过 `connectProxyToNetworks()` 帮助函数批量遍历所有应连网络，链 B 通过内联 `docker network connect` 命令单点直连指定网络。两者机制不同、覆盖范围不同，不可混为一谈。
 
-**补连覆盖的盲区**：即时触发覆盖 99% 的场景，每小时补连是兜底，仅捕获以下边缘情况：
-- 代理崩溃重启后 ServerCheckJob 未及时检测到
-- 应用部署时 `docker network connect` 命令执行失败但未被捕获
-- 底层 Docker 网络状态异常（如 daemon 重启）
+#### 链 A：`connectProxyToNetworks()` 帮助函数
+
+[connectProxyToNetworks()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/bootstrap/helpers/proxy.php#L108-L134) 由 `collectDockerNetworksByServer()` 收集全量应连网络，逐条执行幂等 `docker network connect {net} coolify-proxy >/dev/null 2>&1 || true`。
+
+**直接调用方（函数内联到命令链）**：
+
+| 调用方 | 场景 | 代码位置 |
+|-------|------|---------|
+| [StartProxy](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Proxy/StartProxy.php#L86) | 代理首次启动 / `changeProxy` 切换后启动 | L86 |
+| [RestartProxyJob](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/RestartProxyJob.php#L155) | 代理重启（STOP+START 合并命令链） | L155 |
+| [ConnectProxyToNetworksJob::handle()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/ConnectProxyToNetworksJob.php#L47) | 周期补连 / 即时补连（通过 `instant_remote_process`） | L47-L53 |
+
+**`ConnectProxyToNetworksJob` 派发入口**：
+
+| 派发方 | 方式 | 场景 | 代码位置 |
+|-------|------|------|---------|
+| [StandaloneDocker::boot()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Models/StandaloneDocker.php#L25-L32) | `dispatchSync()` | 模型 `created` 事件：先 `docker network inspect \|\| create`，再派发 Job | L31 |
+| [Destinations::add()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Livewire/Server/Destinations.php#L31-L33) | `dispatchSync()` | UI 添加新网络（**仅 Standalone 模式**，Swarm 分支不调用） | L33, L66 |
+| [ServerCheckJob](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/ServerCheckJob.php#L95) | `dispatchSync()` | 定时巡检发现代理容器运行中 | L95 |
+| [PushServerUpdateJob](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/PushServerUpdateJob.php#L687) | `dispatch()`（异步） | Sentinel 推送时代理运行中 + 缓存键过期 | L684-L688 |
+
+**StandaloneDocker::boot() 的双重动作**（[L25-L32](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Models/StandaloneDocker.php#L25-L32)）：`created` 事件中先通过 `instant_remote_process` 确保网络在 Docker 中存在（`docker network inspect || create`），再 `ConnectProxyToNetworksJob::dispatchSync()` 将代理连入。`InstallDocker` Action 中的 `StandaloneDocker::create()`（[InstallDocker.php L52-L56](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Server/InstallDocker.php#L52-L56)）也经过此路径，安装 Docker 时自动创建默认 `coolify` 网络并连接代理。
+
+**Destinations::add() 仅 Standalone 分支补连**（[L36-L68](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Livewire/Server/Destinations.php#L36-L68)）：Swarm 分支（L38-L51）只创建 SwarmDocker 记录，不调用 `createNetworkAndAttachToProxy()`；Standalone 分支（L52-L67）在 `StandaloneDocker::create()` 后额外调用 `createNetworkAndAttachToProxy()` → `ConnectProxyToNetworksJob::dispatchSync()`。注意此处 StandaloneDocker 的 `created` 事件也会派发同一 Job，导致**双重派发**（两次 `dispatchSync`），但由于 `WithoutOverlapping` 中间件和幂等 `|| true` 命令，实际无副作用。
+
+#### 链 B：内联 `docker network connect` 命令
+
+不经过 `connectProxyToNetworks()` 帮助函数，直接将单条 `docker network connect` 拼入命令链，仅连接**当前应用/服务自身的网络**：
+
+| 调用方 | 命令 | 场景 | 代码位置 |
+|-------|------|------|---------|
+| [ApplicationDeploymentJob](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Jobs/ApplicationDeploymentJob.php#L791-L799) | `docker network connect {networkId} coolify-proxy` | 应用部署时即时连接代理到该应用网络（先 `inspect \|\| create`，再 connect） | L791-L799 |
+| [StartService](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Service/StartService.php#L44) | `docker network connect {uuid} coolify-proxy` | 服务启动时即时连接代理到服务网络 | L44 |
+
+链 B 的关键区别：只连**单个目标网络**，不遍历全量网络集合；在 `docker compose up` 之后立即执行，确保该应用/服务立即可达，无需等待后续的链 A 批量连接。
+
+#### 两条链的协作与覆盖盲区
+
+```
+应用部署
+  ├─ 链 B：内连应用网络 → 即时生效
+  └─ 不走链 A（ApplicationDeploymentJob 不调用 connectProxyToNetworks）
+
+代理启动 / 重启
+  └─ 链 A：批量遍历所有应连网络 → 全量覆盖
+
+服务启动
+  ├─ 链 B：内连服务网络 → 即时生效
+  └─ 不走链 A（StartService 不调用 connectProxyToNetworks）
+
+新建网络（Standalone）
+  └─ 链 A：StandaloneDocker::created → ConnectProxyToNetworksJob → 全量遍历
+
+新建网络（Swarm）
+  └─ 无即时触发 → 仅靠周期补连（PushServerUpdateJob 每小时）
+
+代理崩溃恢复
+  └─ 链 A：ServerCheckJob → ConnectProxyToNetworksJob::dispatchSync → 全量遍历
+
+周期兜底
+  └─ 链 A：PushServerUpdateJob → ConnectProxyToNetworksJob::dispatch → 全量遍历（每小时一次）
+```
+
+**盲区汇总**：
+
+| 场景 | 是否覆盖 | 覆盖链 | 覆盖方 |
+|-----|---------|-------|-------|
+| 代理首次启动 | ✅ | 链 A | StartProxy L86 |
+| 代理重启 | ✅ | 链 A | RestartProxyJob L155 |
+| 应用部署 | ✅ | 链 B | ApplicationDeploymentJob L796 |
+| 服务启动 | ✅ | 链 B | StartService L44 |
+| 新建网络（Standalone） | ✅ | 链 A | StandaloneDocker::boot() L31 |
+| UI 添加网络（Standalone） | ✅ | 链 A | Destinations L33 |
+| UI 添加网络（Swarm） | ❌ | — | 仅靠周期补连 |
+| 代理崩溃后自动恢复 | ✅ | 链 A | ServerCheckJob L95 |
+| Docker daemon 重启 | ⚠️ 延迟 | 链 A | PushServerUpdateJob 下一个周期 |
 
 ---
 
@@ -908,3 +974,80 @@ ServerManagerJob（每分钟运行一次，单进程）
 | 无端口冲突 | return true，继续启动流程 | return true，继续启动流程 |
 | Cloudflare Tunnel 模式 | - | return false，不启动代理 |
 | 代理已 running | return false，不重复启动 | return false，不重复启动 |
+
+---
+
+## 14. Init 中 cleanupUnusedNetworkFromCoolifyProxy 的差集清理
+
+### 14.1 触发时机
+
+[cleanupUnusedNetworkFromCoolifyProxy()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Console/Commands/Init.php#L201-L239) 在 Coolify 每次启动时由 `Init` Artisan 命令调用（[Init.php L76](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Console/Commands/Init.php#L76)），是**唯一**执行代理网络断连和多余网络删除的代码路径。
+
+### 14.2 差集计算逻辑
+
+```
+遍历所有服务器
+  │
+  ├─ 跳过条件：
+  │     ├─ server.isFunctional() === false
+  │     └─ server.isProxyShouldRun() === false
+  │
+  ├─ 调用 collectDockerNetworksByServer($server)
+  │     返回两个集合：
+  │     ├─ $networks    = 当前活跃网络（Standalone/Swarm Docker 网络 + 运行中 Service/Compose/Preview 网络）
+  │     └─ $allNetworks = 全量网络（含已停止的 Service/Compose/Preview 网络）
+  │
+  └─ 计算差集：
+        $removeNetworks = $allNetworks->diff($networks)
+        含义：存在于全量集合但不在活跃集合中的网络 = 不再需要的网络
+```
+
+**差集语义**：`$allNetworks` 包含所有曾经关联的网络（含已停止应用的网络），`$networks` 仅包含当前运行中应用的网络。差集 = 已停止应用的残留网络。
+
+### 14.3 断连与删除判定
+
+对差集中的每个网络，通过 `docker network inspect` 检查是否还有容器连接：
+
+```
+对每个 $network in $removeNetworks：
+  │
+  ├─ docker network inspect -f json {network} | jq '.[].Containers | if . == {} then null else . end'
+  │
+  ├─ 结果为空（网络无容器）：
+  │     ├─ docker network disconnect {network} coolify-proxy >/dev/null 2>&1 || true
+  │     └─ docker network rm {network} >/dev/null 2>&1 || true
+  │
+  └─ 结果非空（有容器连接）：
+        └─ 检查容器数量 == 1 且唯一容器为 coolify-proxy 自身：
+              ├─ docker network disconnect {network} coolify-proxy >/dev/null 2>&1 || true
+              └─ docker network rm {network} >/dev/null 2>&1 || true
+            否则：不做任何操作（有其他容器在使用，不能删除）
+```
+
+**关键安全规则**：
+1. 网络为空（无容器） → 安全断连 + 删除
+2. 网络仅剩 coolify-proxy 自身 → 断连代理 + 删除（代理不应独占网络）
+3. 网络有其他容器 → **不操作**（避免影响运行中容器）
+
+### 14.4 与 `connectProxyToNetworks` 的互补关系
+
+`connectProxyToNetworks()` 是"加法"（只连不断），`cleanupUnusedNetworkFromCoolifyProxy()` 是"减法"（断连 + 删除）。两者配合：
+
+| 操作 | 加法（connect） | 减法（cleanup） |
+|-----|---------------|---------------|
+| 触发频率 | 每次代理启动 / 应用部署 / 每小时补连 | 仅 Coolify 启动时 |
+| 操作 | `docker network connect` | `docker network disconnect` + `docker network rm` |
+| 判定依据 | `collectDockerNetworksByServer()` 的 `$networks` 集合 | `$allNetworks` 与 `$networks` 的差集 |
+| 容器检查 | 不检查，幂等 `|| true` | 必须检查，有其他容器则跳过 |
+
+**残留网络的典型场景**：应用被销毁后，其 Docker 网络不再被任何运行中容器使用，但 coolify-proxy 仍然连接着。此函数在下次 Coolify 启动时清理这些孤儿网络。
+
+### 14.5 执行方式
+
+```php
+remote_process(command: $commands, type: ActivityTypes::INLINE->value, server: $server, ignore_errors: false);
+```
+
+- 使用 `remote_process()` 异步执行
+- `ignore_errors: false` — 任一命令失败会中断该服务器的清理流程
+- 但外层 `catch (\Throwable $e)` 仅 echo 错误信息，不中断其他服务器的清理
