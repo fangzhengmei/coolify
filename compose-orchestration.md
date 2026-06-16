@@ -1161,7 +1161,52 @@ switch ($server->proxyType()) {
 
 **关键代码：** [docker.php:L414-L650](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L414-L650)
 
-#### 12.2.1 多域名遍历机制
+#### 12.2.1 全局中间件与 UUID 隔离
+
+**redirect-to-https 全局定义：**
+
+在函数开头，redirect-to-https 中间件被**全局定义一次**，供所有域名的 HTTP 路由共享引用：
+
+**关键代码：** [docker.php:L418-L422](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L418-L422)
+
+```php
+function fqdnLabelsForTraefik(...)
+{
+    $labels = collect([]);
+    $labels->push('traefik.enable=true');
+    if ($is_gzip_enabled) {
+        $labels->push('traefik.http.middlewares.gzip.compress=true');
+    }
+    $labels->push('traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https');
+    // ... 其余处理
+}
+```
+
+**说明：** `redirect-to-https` 和 `gzip` 中间件在所有路由处理之前定义，每个域名的 HTTP 路由只需通过 `middlewares=redirect-to-https` 引用即可，避免重复定义。
+
+**unique_uuid 隔离机制：**
+
+当 `generate_unique_uuid = true` 时，每个域名在循环内部会生成**独立的 Cuid2 UUID**，确保路由规则完全隔离：
+
+**关键代码：** [docker.php:L459-L463](file:///d:/fz/0601-1/solo-dogfeeding/code/92-coolify/bootstrap/helpers/docker.php#L459-L463)
+
+```php
+foreach ($domains as $loop => $domain) {
+    try {
+        if ($generate_unique_uuid) {
+            $uuid = new Cuid2;  // 每个域名重新生成 UUID
+        }
+        // ... 使用新的 UUID 生成路由标签
+    }
+}
+```
+
+**效果：**
+- 当 `generate_unique_uuid = false`（默认）：所有域名共享同一个 UUID，路由标签如 `http-0-abc123`, `http-1-abc123`
+- 当 `generate_unique_uuid = true`：每个域名使用独立 UUID，路由标签如 `http-0-xyz789`, `http-1-def456`
+- 应用场景：需要完全隔离的多域名部署，避免一个域名的配置变更影响其他域名
+
+#### 12.2.2 多域名遍历机制
 
 Traefik 标签生成函数的核心结构是对每个域名**独立遍历**，为每个域名生成完整的路由规则集：
 
