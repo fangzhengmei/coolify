@@ -414,3 +414,243 @@ StartProxy/RestartProxyJob 被触发
           │
           └─ 检测到代理缺失? → 回到 StartProxy 流程
 ```
+
+---
+
+## 8. NGINX 代理类型：枚举占位与实际缺失
+
+### 8.1 枚举定义与路径映射
+
+[ProxyTypes](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Enums/ProxyTypes.php) 枚举中定义了四种代理类型：`NONE`、`TRAEFIK`、`NGINX`、`CADDY`。NGINX 在枚举层面与 TRAEFIK/CADDY 地位相同，[Server::proxyPath()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Models/Server.php#L616-L630) 也为 NGINX 分配了独立路径后缀 `/nginx`：
+
+```
+TRAEFIK → /traefik
+CADDY   → /caddy
+NGINX   → /nginx
+```
+
+但路径映射是 NGINX 在代码中唯一真正可用的功能。
+
+### 8.2 各代码分支对 NGINX 的处理差异
+
+| 代码位置 | NGINX 分支状态 | 具体行为 |
+|---------|--------------|---------|
+| [ProxyTypes 枚举](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Enums/ProxyTypes.php) | ✅ 已定义 | `NGINX` 枚举值存在 |
+| [Server::proxyPath()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Models/Server.php#L616-L630) | ✅ 已映射 | 返回 `/nginx` 路径后缀 |
+| [configMatchesProxyType()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Actions/Proxy/GetProxyConfiguration.php#L76-L92) | ✅ 已校验 | 检查 `services.nginx` 键名 |
+| [generateDefaultProxyConfiguration()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/bootstrap/helpers/proxy.php#L226) | ❌ 返回 null | `else` 分支：非 TRAEFIK/CADDY 均返回 null |
+| [generateLabelsApplication()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/bootstrap/helpers/docker.php#L651-L793) | ❌ 无分支 | switch 仅处理 TRAEFIK/CADDY，无 NGINX case |
+| [fqdnLabelsForTraefik()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/bootstrap/helpers/docker.php#L414-L650) | ❌ 不适用 | 仅生成 Traefik 格式标签 |
+| [fqdnLabelsForCaddy()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/bootstrap/helpers/docker.php) | ❌ 不适用 | 仅生成 Caddy 格式标签 |
+| [setupDefaultRedirect()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Models/Server.php#L350) | ❌ 无分支 | `$default_redirect_file` 变量在 NGINX 分支未赋值 |
+| [setupDynamicProxyConfiguration()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Models/Server.php#L447) | ❌ 无分支 | 仅生成 Traefik YAML / Caddy Caddyfile |
+| [proxy.blade.php UI](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/resources/views/livewire/server/proxy.blade.php#L172-L174) | ❌ 已注释 | NGINX 按钮 `disabled` 且被注释 |
+
+### 8.3 NGINX 尝试启动的代码走向
+
+若用户通过数据库或 API 强制将代理类型设为 NGINX，启动流程会经历以下路径：
+
+```
+StartProxy::handle()
+  │
+  ├─ GetProxyConfiguration::run()
+  │     ├─ 第一级：DB 中 last_saved_proxy_configuration 为空（从未成功保存过 NGINX 配置）
+  │     ├─ 第二级：backfillFromDisk() → SSH 读取 /nginx/docker-compose.yml → 文件不存在 → 失败
+  │     └─ 第三级：generateDefaultProxyConfiguration() → 返回 null
+  │
+  ├─ SaveProxyConfiguration::run($server, null)
+  │     └─ 配置为 null，写入空内容到磁盘
+  │
+  ├─ docker compose up -d → YAML 为空/无效 → 启动失败
+  │
+  └─ 代理状态停留在 'starting' → 被 ServerCheckJob 标记为异常
+```
+
+**结论**：NGINX 是纯粹的枚举占位符，Coolify 当前版本**不可使用** NGINX 作为反向代理。枚举定义、路径映射和类型校验是遗留骨架，缺少核心实现（默认配置生成、标签生成、动态配置生成、UI 入口）。若强行设置为 NGINX 类型，代理将无法启动。
+
+---
+
+## 9. dynamic 目录规则文件的触发点与覆盖含义
+
+### 9.1 dynamic 目录下的文件清单
+
+| 文件名 | 代理类型 | 生成方 | 作用 |
+|-------|---------|-------|------|
+| `coolify.yaml` | Traefik | `setupDynamicProxyConfiguration()` | Coolify 面板自身的 Traefik 路由规则（Host 规则 + TLS + 中间件） |
+| `default_redirect_503.yaml` | Traefik | `setupDefaultRedirect()` | 未匹配任何应用域名的兜底 503/重定向规则 |
+| `Caddyfile` | Caddy | `setupDynamicProxyConfiguration()` | Caddy 入口配置（`import /dynamic/*.caddy`） |
+| `*.caddy` | Caddy | 用户通过 UI 创建 | 用户自定义 Caddy 动态路由片段 |
+| `*.yaml`（非 coolify.yaml） | Traefik | 用户通过 UI 创建 | 用户自定义 Traefik 动态路由规则 |
+
+### 9.2 各生成函数的触发链路
+
+#### setupDynamicProxyConfiguration()
+
+此函数为 Coolify 面板自身生成代理路由，触发点有 3 个：
+
+| 触发场景 | 入口 | 代码位置 |
+|---------|------|---------|
+| 代理状态变为 `running` | `ProxyStatusChangedNotification` 监听器 | [ProxyStatusChangedNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Listeners/ProxyStatusChangedNotification.php) |
+| Coolify 启动初始化 | `Init` Artisan 命令 | [Init.php](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Console/Commands/Init.php#L140) |
+| 服务器设置页面保存 | `Proxy` Livewire 组件 | 通过 Server 模型方法调用 |
+
+函数内部根据代理类型分支：
+
+```
+setupDynamicProxyConfiguration()
+  │
+  ├─ TRAEFIK:
+  │     ├─ 读取 coolify.yaml 内容（包含 Coolify 面板域名、TLS、中间件配置）
+  │     ├─ 通过 SSH 写入 $proxy_path/dynamic/coolify.yaml
+  │     └─ Traefik 的 --providers.file.watch=true 自动热加载
+  │
+  ├─ CADDY:
+  │     ├─ 生成 Caddyfile 内容（import /dynamic/*.caddy）
+  │     ├─ 通过 SSH 写入 $proxy_path/dynamic/Caddyfile
+  │     └─ Caddy 的 import 机制自动生效
+  │
+  └─ NGINX: 无分支，不生成任何文件
+```
+
+#### setupDefaultRedirect()
+
+此函数生成未匹配域名的兜底规则，触发点同上（代理 `running` 状态事件）：
+
+```
+setupDefaultRedirect()
+  │
+  ├─ TRAEFIK:
+  │     ├─ 生成 default_redirect_503.yaml
+  │     │     ├─ redirect_type=503 → 返回 503 Service Unavailable
+  │     │     └─ redirect_type=redirect → 302 重定向到目标 URL
+  │     └─ 通过 SSH 写入 $proxy_path/dynamic/default_redirect_503.yaml
+  │
+  ├─ CADDY: 无对应功能（Caddy 默认行为已处理）
+  │
+  └─ NGINX: 无分支，$default_redirect_file 变量未赋值（PHP 会产生 undefined variable 警告）
+```
+
+### 9.3 覆盖语义
+
+每次触发 `setupDynamicProxyConfiguration()` 或 `setupDefaultRedirect()` 时，**完整覆盖**对应文件内容：
+
+- `coolify.yaml` — 始终根据 Coolify 面板当前域名设置重新生成，全量覆盖
+- `default_redirect_503.yaml` — 始终根据服务器当前 redirect_type 设置重新生成，全量覆盖
+- `Caddyfile` — 始终覆盖为 `import /dynamic/*.caddy`
+
+用户通过 UI 创建的自定义动态配置（非保留文件名）**不会被覆盖**，因为这两个函数仅写入固定文件名。`coolify.yaml` 是保留名称，用户创建动态配置时会被阻止使用该名称。
+
+### 9.4 proxy_settings.json 不存在
+
+经代码搜索确认，**`proxy_settings.json` 文件在 Coolify 代码库中不存在**。Blade 模板 [dynamic-configurations.blade.php](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/resources/views/livewire/server/proxy/dynamic-configurations.blade.php) 中的 `proxy_settings` 仅是 textarea 的 HTML `name` 属性，用于只读展示 dynamic 目录下的保留文件内容，并不对应任何磁盘上的 JSON 文件。
+
+---
+
+## 10. changeProxy 代理切换：旧配置清理与标签重新生成
+
+### 10.1 changeProxy 执行流程
+
+[Server::changeProxy()](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Models/Server.php#L1487) 在用户切换代理类型时调用：
+
+```
+changeProxy($new_type)
+  │
+  ├─ 1. 数据库清理
+  │     ├─ proxy->type = $new_type
+  │     ├─ proxy->status = 'restarting'
+  │     ├─ proxy->last_saved_settings = null
+  │     ├─ proxy->last_saved_proxy_configuration = null
+  │     └─ proxy->last_applied_settings = null
+  │
+  └─ 2. 启动新代理
+        └─ StartProxy::run($server, async: true)
+              ├─ GetProxyConfiguration → 走第三级（DB 为 null → 磁盘文件不匹配 → 默认生成）
+              ├─ SaveProxyConfiguration → 写入新类型配置
+              └─ docker compose up -d → 启动新类型代理容器
+```
+
+### 10.2 旧配置清理分析
+
+#### 数据库侧（✅ 已清理）
+
+`changeProxy()` 将 `last_saved_settings`、`last_saved_proxy_configuration`、`last_applied_settings` 全部置为 null，确保新代理启动时不会误读旧类型配置。
+
+#### 服务器磁盘侧（❌ 未清理）
+
+切换代理类型后，以下旧文件**不会被删除**：
+
+| 遗留内容 | 位置 | 影响 |
+|---------|------|------|
+| 旧 `docker-compose.yml` | `$proxy_path/docker-compose.yml` | 启动时被新配置覆盖（无害） |
+| 旧 `backups/` 目录 | `$proxy_path/backups/` | 历史备份保留，不自动清理（无害但占用磁盘） |
+| 旧 `dynamic/coolify.yaml` | `$proxy_path/dynamic/coolify.yaml` | Traefik → Caddy 切换后：Caddy 忽略 .yaml 文件（无害） |
+| 旧 `dynamic/default_redirect_503.yaml` | `$proxy_path/dynamic/default_redirect_503.yaml` | 同上（无害） |
+| 旧 `dynamic/Caddyfile` | `$proxy_path/dynamic/Caddyfile` | Caddy → Traefik 切换后：Traefik 忽略 Caddyfile（无害） |
+| 旧 `dynamic/*.caddy` 用户文件 | `$proxy_path/dynamic/*.caddy` | Traefik 忽略 .caddy 文件（无害） |
+| 旧 `dynamic/*.yaml` 用户文件 | `$proxy_path/dynamic/*.yaml` | Caddy 忽略 .yaml 文件（无害） |
+| 旧代理 Docker 容器 | `coolify-proxy` 容器 | `docker compose up --remove-orphans` 会移除旧容器 |
+
+**关键点**：不同代理类型的动态配置文件扩展名不同（Traefik 用 `.yaml`，Caddy 用 `.caddy`），因此旧格式的动态配置文件对新代理类型是**惰性的** — 存在但不被加载。Traefik 的 File provider 只读 `.yaml`/`.toml`，Caddy 的 import 指令只读 `.caddy` 文件。
+
+**例外风险**：若 Traefik → Traefik 切换（如先 NONE 再 TRAEFIK），或 Caddy → Caddy 切换，旧的自定义动态配置文件不会被清理，可能产生意外路由规则。这在正常使用中不太可能发生。
+
+### 10.3 应用标签重新生成
+
+代理切换后，已部署应用的容器标签不会自动更新。标签的重新生成取决于 `generate_exact_labels` 设置：
+
+#### 兼容模式（generate_exact_labels = false，默认）
+
+**无需任何操作**。兼容模式下，`generateLabelsApplication()` 同时生成 Traefik 和 Caddy 两套标签：
+
+```
+兼容标签 = Traefik 标签 + Caddy 标签
+```
+
+无论切换到哪种代理类型，容器上已有对应格式的标签，新代理启动后即可发现路由。这是默认行为，也是推荐的安全模式。
+
+#### 精确模式（generate_exact_labels = true）
+
+**需要手动重新部署应用**。精确模式下，`generateLabelsApplication()` 仅生成当前代理类型的标签：
+
+```
+TRAEFIK 时标签 = 仅 Traefik 标签
+CADDY 时标签   = 仅 Caddy 标签
+```
+
+切换代理后，已有容器上的标签与新代理类型不匹配：
+
+| 切换方向 | 旧标签 | 新代理 | 结果 |
+|---------|-------|-------|------|
+| TRAEFIK → CADDY | 仅 Traefik 标签 | Caddy | Caddy 无法发现任何路由 → **全站 404** |
+| CADDY → TRAEFIK | 仅 Caddy 标签 | Traefik | Traefik 无法发现任何路由 → **全站 404** |
+
+恢复方式：
+1. 逐个重新部署应用（触发 `generateLabelsApplication()` 生成新类型标签）
+2. 或在应用 Advanced 页面点击"Reset Default Labels"（[Advanced.php](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/app/Livewire/Project/Application/Advanced.php#L163) 的 `resetDefaultLabels()` 方法），然后重新部署
+3. 或将 `generate_exact_labels` 改回 `false`（兼容模式），然后重新部署任一应用触发标签刷新
+
+UI 中已有明确提示（[proxy.blade.php](file:///d:/fz/0601-1/solo-dogfeeding/code/94-coolify/resources/views/livewire/server/proxy.blade.php#L36-L38)）：启用精确标签模式后切换代理类型，需要手动重新生成应用标签。
+
+### 10.4 切换流程时序
+
+```
+用户选择新代理类型 → changeProxy()
+  │
+  ├─ DB 清理（nullify last_saved_*, last_applied_settings）
+  │
+  ├─ StartProxy::run()
+  │     ├─ GetProxyConfiguration → 默认生成新类型配置
+  │     ├─ SaveProxyConfiguration → 覆盖写入 docker-compose.yml
+  │     ├─ docker compose up --remove-orphans → 启动新容器 + 移除旧容器
+  │     └─ connectProxyToNetworks → 接入应用网络
+  │
+  ├─ ProxyStatusChangedNotification 触发
+  │     ├─ setupDefaultRedirect() → 写入新类型兜底规则
+  │     └─ setupDynamicProxyConfiguration() → 写入新类型 Coolify 自身路由
+  │
+  ├─ 旧 dynamic/ 文件变为惰性（扩展名不被新代理加载）
+  │
+  └─ 已部署应用标签状态：
+        ├─ 兼容模式 → 无需操作，双标签覆盖
+        └─ 精确模式 → 需重新部署所有应用以刷新标签
+```
