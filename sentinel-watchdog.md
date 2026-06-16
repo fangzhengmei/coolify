@@ -141,45 +141,63 @@ return ($cycleIndex + $serverHash) % $interval !== 0;
 
 ### 可达性变更事件
 
-[ServerReachabilityChanged](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Events/ServerReachabilityChanged.php#L8-L17) 在构造函数中直接调用 `server->isReachableChanged()`：
+[ServerReachabilityChanged](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Events/ServerReachabilityChanged.php#L8-L17) 的唯一功能是在构造函数中直接调用 `server->isReachableChanged()`，由 [Server::isReachableChanged()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/Server.php#L1235-L1252) 执行实际的通知逻辑：
 
-- 服务器恢复可达 + 之前发过不可达通知 → 发送恢复通知
-- 服务器不可达 + `unreachable_count >= 2` + 尚未发过通知 → 发送不可达通知
+```php
+// isReachableChanged() 内部逻辑：
+if ($isReachable === true && $unreachableNotificationSent) {
+    $this->sendReachableNotification();  // 发恢复通知 + unreachable_notification_sent = false + save();
+}
+if (!$isReachable && $this->unreachable_count >= 2 && !$unreachableNotificationSent) {
+    $this->sendUnreachableNotification(); // 发不可达通知 + unreachable_notification_sent = true + save();
+}
+```
 
 阈值为 2：单次抖动不触发通知，连续 2 次不可达才发。
 
 #### 构造即副作用：反 Laravel 惯例的设计
 
-[ServerReachabilityChanged](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Events/ServerReachabilityChanged.php#L8-L17) 的设计**违反了 Laravel 的惯例**：
+**Laravel 对 Event 类的惯例是：** Event 应该是纯数据载体（DTO），只承载事件相关的属性，不该有任何副作用。副作用（写数据库、发通知等）应该放在 Listener 中执行。Event 本身只是一个「信号」。
 
-```php
-public function __construct(public readonly Server $server)
-{
-    $this->server->isReachableChanged();
-}
-```
+**这里的实现完全打破了这一惯例：** 构造函数里直接调用 `isReachableChanged()`，把「判定是否需要通知 + 更新通知标记 + 写数据库 + 发送通知」全部做了。这个 Event 没有任何 Listener，构造即执行。
 
-**Laravel 惯例**：Event 类应该是**纯数据载体**（DTO），只承载事件相关的属性，不应该有副作用。副作用（发通知、写数据库操作应该在 Listener 里做。
+**为什么这么设计（可能的权衡）：**
+- 简单直接，不需要注册 Listener，少一个文件
+- 判断逻辑封装在模型方法 `isReachableChanged()` 里，Event 只是一个触发壳
+- 避免了 Listener 注册和发现的样板代码
 
-**这里的做法**：构造函数里直接调用 `isReachableChanged()`——相当于把「判定要不要发通知 + 更新通知 + 修改数据库」全都做了，整个事件的**没有 Listener，构造即执行。
+**代价（这个设计的真实问题）：**
 
-**为什么这么设计**（可能的权衡）：
-- 简单直接，不需要注册 Listener，代码少一个文件
-- `isReachableChanged()` 是个「检查方法，不需要事件是「判断逻辑封装在模型方法里，事件只是个触发点
-- 避免了 Listener → Listener 注册和 Listener 发现，保持模型方法里
+**代价 1：4 个 dispatch 点的副作用全部集中在构造函数中**
 
-**代价**：
-- 不符合 Laravel 事件系统完全脱节了「事件 + Listener 的可扩展性差——想加新的 Listener 的副作用不——触发，构造函数里已经执行了
-- 测试困难——事件的语义被破坏了，「事件被 dispatch 了就一定会执行，就一定会产生副作用
-- 「事件」名不副实：它更像一个「动作」而不是「事件」
+以下 4 个位置调用 `ServerReachabilityChanged::dispatch($server)` 后，构造函数立即执行 `isReachableChanged()`，副作用在 dispatch 的同一瞬间就完成了：
 
-调用位置：
-- [Server::validateConnection() 里 SSH 可达/不可达时 dispatch
-- [Team::forceDisableServer() 里手动强制禁用时 dispatch
-- [Livewire Server\Show] 里手动验证时 dispatch
-- [ValidateAndInstallServerJob] 安装验证时 dispatch
+1. [Server::validateConnection()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/Server.php#L1282-L1293) — SSH 可达性检测结果变化时
+2. [Team::forceDisableServer()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/Team.php#L238) — 手动强制禁用服务器
+3. [Livewire Server\Show](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Livewire/Server/Show.php#L309) — 前端手动验证服务器连通性
+4. [ValidateAndInstallServerJob](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Jobs/ValidateAndInstallServerJob.php#L191) — 服务器安装验证
 
-总共 4 个 dispatch 点，全部都是「触发后直接执行副作用。
+无论从哪个入口 dispatch，副作用都在构造函数里完成，后续没有任何 Listener 能改变这一行为。
+
+**代价 2：添加 Listener 无效**
+
+假设开发者想在可达性变化时做额外的事（比如写审计日志、触发 Webhook、同步到监控系统），按 Laravel 惯例应该加一个 Listener。但加了也没用——副作用在 dispatch 时构造函数里已经执行完了，Listener 拿到的是一个空壳 Event。即便 Listener 再调一次 `isReachableChanged()`，也只会再执行一遍副作用。
+
+更关键的是：Laravel 支持 `ShouldQueue` 异步 Listener，但这个 Event 的副作用在构造函数同步执行，异步 Listener 的延迟语义完全失效。
+
+**代价 3：可扩展性差**
+
+如果将来想把通知拆成多个独立阶段（比如可达性变化 → 触发审计日志 → 触发监控告警 → 触发业务通知），完全做不到。Event 的执行路径被锁死在「构造函数 → isReachableChanged()」这一条单链上。
+
+**代价 4：单测隔离困难**
+
+正常 Laravel Event 可以用 `Event::fake()` 来阻止真实 Listener 执行，只断言 Event 是否被 dispatch。但这个 Event 根本没有 Listener，`Event::fake()` 没用——构造函数里的副作用照样执行，照样写数据库、照样发通知。想测「dispatch 了这个 Event」就必须接受所有副作用。
+
+想单独测试「某个 dispatch 点是否正确触发了事件」也做不到——因为测试里必须 stub 整个通知系统：必须用 `Notification::fake()` 才能阻止真实通知，必须 mock Server 模型才能阻止数据库写入，测试 setup 极其笨重。
+
+**总结：**
+
+类名 `ServerReachabilityChanged` 叫 Event 名不副实。它更像一个「动作类」（Action）而不是「事件」（Event）。dispatch 它等于直接执行一个匿名函数，等于调用一个方法，而不是广播一个信号。
 
 ---
 
@@ -1168,7 +1186,7 @@ if ($this->containers->isEmpty()) {
 16. **字符白名单防注入**：`isValidSentinelToken` 用正则 `[a-zA-Z0-9._\-+=\/]` 限制 token 字符集，拼 shell 命令时无注入风险
 17. **Sentinel API 边车自洽**：Docker health check 调自己的 /api/health，版本检查调自己的 /api/version，只监听 127.0.0.1，安全不暴露
 18. **auditLog 双通道**：成功走 info 级别、失败走 auditLogWebhookFailure 的 warning 级别，都进 audit channel，失败安全绝不打断主流程
-19. **构造即副作用的 Event**：ServerReachabilityChanged 在构造函数里直接执行 isReachableChanged()，没有 Listener，反 Laravel 惯例但更简单
+19. **构造即副作用的 Event**：ServerReachabilityChanged 在构造函数里直接执行 isReachableChanged()，无 Listener，4 个 dispatch 点的副作用集中在构造函数中，导致加 Listener 无效、可扩展性差、Event::fake() 单测无法隔离副作用，名不副实更像 Action 而非 Event
 20. **ServerPatchCheckJob 周日扫描**：每周日零点检查系统更新，tries=3、timeout=600s、WithoutOverlapping 不重叠，服务器离线直接跳过
 21. **Console Kernel dev/prod 双轨制**：dev 环境去掉了所有 cleanup 类任务（unreachable-servers/database/preview 清理/redis 锁/sanctum 过期），只保留核心调度，避免开发时数据被清
 22. **isFunctional 的 ssh-mux 清理**：服务器不可操作时删除多路复用控制文件，防止僵死连接
