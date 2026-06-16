@@ -246,14 +246,37 @@ if (! $dockerInstalled || ! $dockerComposeInstalled) {
 
 | 问题 | 答案 |
 |-----|------|
-| **numberOfTries 从哪来？** | 构造函数传入，首次调用为 0 |
-| **重试次数计数包含首次吗？** | 包含。numberOfTries=0 是第1次尝试，达到 3 时终止。实际可执行：检查→安装→重试(1)→检查→安装→重试(2)→检查→安装→重试(3)→终止。共 3 次安装机会。 |
-| **安装成功后还会重试吗？** | 不会。安装后重新 dispatch 新 Job，新 Job 会从第一步重新开始校验。如果此时前置依赖/Docker 已安装，校验会通过，流程继续向下。 |
+| **numberOfTries 从哪来？** | 构造函数传入，首次调用为 `numberOfTries = 0 |
+| **最大安装机会有几次？** | 3 次。`numberOfTries` 取值为 `0`、`1`、`2` 时各执行 1 次安装，共 3 次 |
+| **终止条件是什么？** | `numberOfTries >= maxTries`（即 `numberOfTries = 3` 时），不再安装，直接终止 |
+| **安装成功后还会重试吗？** | 不会。安装后重新 dispatch 新 Job，新 Job 从第一步重新开始校验。如果前置依赖/Docker 已安装，校验通过，流程继续向下。 |
 | **重试时会重新校验连接吗？** | 会。每次新 Job 都会从 `validateConnection()` 开始，完整重新执行所有校验步骤。 |
 | **安装失败会怎样？** | `installPrerequisites()` 和 `installDocker()` 内部通过 `remote_process()` 执行命令。如果命令执行失败会抛出异常，被 Job 的 `catch` 捕获，`is_validating` 设为 `false`，流程终止。 |
 | **30秒延迟的作用？** | 给安装命令留出执行时间，避免立即重试时安装还未完成。 |
 
-### 4.4 重试流程时序图
+### 4.4 按 numberOfTries 取值的详细推导
+
+核心判定代码：
+
+```php
+if ($this->numberOfTries >= $this->maxTries) {
+    // 终止
+} else {
+    // 执行安装
+    // dispatch 新 Job, numberOfTries + 1
+}
+```
+
+`maxTries = 3`，推导各取值的行为：
+
+| numberOfTries 取值 | 校验失败后的动作 | 安装次数 | 下一步 |
+|----------------|--------------|---------|--------|
+| 0 | `0 >= 3` → false → 执行安装 | 第 1 次 | dispatch(1)，30秒后重试 |
+| 1 | `1 >= 3` → false → 执行安装 | 第 2 次 | dispatch(2)，30秒后重试 |
+| 2 | `2 >= 3` → false → 执行安装 | 第 3 次 | dispatch(3)，30秒后重试 |
+| 3 | `3 >= 3` → true → 终止 | — | 写入错误日志，`is_validating = false` |
+
+### 4.5 重试流程时序图（前置依赖安装成功场景）
 
 ```
 首次调用: numberOfTries=0
@@ -262,9 +285,7 @@ validateConnection() ✓
 validateOS() ✓
 validatePrerequisites() ✗ (missing: git)
     ↓
-numberOfTries (0) < maxTries (3)
-    ↓
-installPrerequisites() 执行安装
+0 < 3 → 执行第1次安装
     ↓
 dispatch 新 Job, numberOfTries=1, delay 30s
     ↓
@@ -294,22 +315,64 @@ public function validateDockerEngineVersion()
 
     if (is_null($dockerVersion)) {
         $this->settings->is_usable = false;
+        $this->settings->save();
         return false;
     }
     // 成功
     $this->settings->is_reachable = true;
     $this->settings->is_usable = true;
+    $this->settings->save();
     ServerReachabilityChanged::dispatch($this);
     return true;
 }
 ```
 
-**校验结果 → 状态字段** 对应关系：
+### 5.1 失败路径的状态字段全貌
 
-| 校验结果 | `settings.is_reachable` | `settings.is_usable` | 广播事件 |
-|---------|------------------------|---------------------|----------|
-| 版本不满足 | 未修改 | `false` | - |
-| 版本满足 | `true` | `true` | `ServerReachabilityChanged` |
+Docker 版本验证失败时，状态字段分两处设置，按执行顺序：
+
+**第一步：在 `validateDockerEngineVersion()` 内部**（[L1390-L1394](file:///d:/fz/0601-1/solo-dogfeeding/code/93-coolify/app/Models/Server.php#L1390-L1394)）
+```php
+if (is_null($dockerVersion)) {
+    $this->settings->is_usable = false;  // ①
+    $this->settings->save();             // ② 持久化到 server_settings 表
+    return false;
+}
+```
+
+**第二步：回到 Job 的失败分支**（[L149-L161](file:///d:/fz/0601-1/solo-dogfeeding/code/93-coolify/app/Jobs/ValidateAndInstallServerJob.php#L149-L161)）
+```php
+if (! $dockerVersion) {
+    $errorMessage = 'Minimum Docker Engine version ...';
+    $this->server->update([              // ③ 写入 servers 表
+        'validation_logs' => $errorMessage,
+        'is_validating' => false,
+    ]);
+    return;  // 终止流程
+}
+```
+
+**完整执行顺序和字段变化**：
+
+| 步骤 | 代码位置 | 修改字段 | 值 | 表 |
+|-----|---------|---------|----|-----|
+| ① | `validateDockerEngineVersion` L1391 | `settings.is_usable` | `false` | 内存 |
+| ② | `validateDockerEngineVersion` L1392 | 持久化 | - | `server_settings` |
+| ③ | Job L152-L155 | `validation_logs` | 错误信息（提示手动安装 Docker） | `servers` |
+| ③ | Job L152-L155 | `is_validating` | `false` | `servers` |
+
+**校验结果 → 状态字段** 完整对应关系：
+
+| 校验结果 | `validation_logs` | `is_validating` | `settings.is_reachable` | `settings.is_usable` | 广播事件 |
+|---------|-------------------|-----------------|------------------------|---------------------|----------|
+| 版本不满足 | 写入错误信息（提示手动安装 Docker） | `false` | 未修改（保持之前的值） | `false`（在 validateDockerEngineVersion 内部设置） | - |
+| 版本满足 | 未修改 | 未修改（后续代理启动后才置为 false） | `true` | `true` | `ServerReachabilityChanged` |
+
+**补充说明**：
+- 版本不满足时，**没有重试机制**，直接终止流程
+- `settings.is_usable = false` 在模型方法内部先设置并保存
+- 回到 Job 后再设置 `validation_logs` 和 `is_validating = false`，然后 `return`
+- 注意 `settings.is_reachable` 在此处不修改，它的设置点是 `validateConnection()` 和版本满足时
 
 ---
 
