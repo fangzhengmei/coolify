@@ -15,6 +15,43 @@
 
 下面按这四个段逐一拆解。
 
+#### Console Kernel dev 分支与生产分支的差异
+
+[Console Kernel](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Console/Kernel.php#L32-L94) 的 `schedule()` 方法用 `if (isDev())` 分了两套调度配置，差异很大：
+
+| 调度项 | Dev 分支 | Production 分支 |
+|--------|---------|----------------|
+| ServerManagerJob | everyMinute | everyMinute（两边都有） |
+| horizon:snapshot | everyMinute | everyFiveMinutes |
+| CleanupInstanceStuffsJob | everyMinute | everyTwoMinutes |
+| CheckHelperImageJob | everyTenMinutes | 跟随 update_check_frequency |
+| ScheduledJobManager | everyMinute | everyMinute（两边都有） |
+| uploads:clear | everyTwoMinutes | everyTwoMinutes（两边都有） |
+| cleanup:unreachable-servers | ❌ 没有 | daily（每日） |
+| cleanup:database --yes | ❌ 没有 | daily（每日） |
+| PullTemplatesFromCDN | ❌ 没有 | 跟随 update_check_frequency |
+| PullChangelog | ❌ 没有 | 跟随 update_check_frequency |
+| CheckForUpdatesJob | ❌ 没有 | 跟随 update_check_frequency |
+| UpdateCoolifyJob | ❌ 没有 | 跟随 is_auto_update_enabled |
+| RegenerateSslCertJob | ❌ 没有 | twiceDaily |
+| CheckTraefikVersionJob | ❌ 没有 | 每周日零点 |
+| CleanupOrphanedPreviewContainersJob | ❌ 没有 | daily |
+| cleanup:redis --clear-locks | ❌ 没有 | daily |
+| sanctum:prune-expired | ❌ 没有 | hourly |
+| ApiTokenExpirationWarningJob | ❌ 没有 | hourly |
+| cleanup:ssh-mux | hourly（条件触发） | hourly（条件触发） |
+
+**dev 环境缺失的关键清理任务**：
+- `cleanup:unreachable-servers` — 7 天不可达服务器自动禁用
+- `cleanup:database --yes` — 数据库清理
+- `CleanupOrphanedPreviewContainersJob` — 孤立预览容器清理
+- `cleanup:redis --clear-locks` — Redis 锁清理
+
+**设计意图**：开发环境下不跑这些清理任务，避免开发时数据被清掉、服务器被误禁用。同时开发环境更新检查更频繁（每分钟），方便调试。
+
+**两边都有的 ServerManagerJob 差异**：
+虽然两边都是 everyMinute，但 ServerManagerJob 内部的 `checkFrequency` 会根据 `isCloud()` 变化——但 dev 环境通常不是 cloud，所以都是 1 分钟周期。真正的差异在 Kernel 层的其他调度项。
+
 ---
 
 ## 二、段 1：远程守护进程检查 — ServerConnectionCheckJob
@@ -66,6 +103,42 @@
 
 退避使用 `crc32(server_id)` 哈希分散检查，避免惊群效应。
 
+#### 退避分粒度时序：自建 1min vs 云 5min 的两套周期
+
+退避不是以绝对时间计算的，而是以**调度周期倍数**为单位。周期长度由环境决定：
+
+- **自建环境**：`checkFrequency = '* * * * *'` → 每 1 分钟一个周期
+- **云环境**：`checkFrequency = '*/5 * * * *'` → 每 5 分钟一个周期
+
+[ServerManagerJob::shouldSkipDueToBackoff()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Jobs/ServerManagerJob.php#L193-L207) 的计算方式：
+
+```php
+$cyclePeriodMinutes = isCloud() ? 5 : 1;
+$cycleIndex = intdiv($this->executionTime->minute, $cyclePeriodMinutes);
+$serverHash = abs(crc32((string)$server->id));
+return ($cycleIndex + $serverHash) % $interval !== 0;
+```
+
+**为什么用周期索引 + 哈希取模**：
+- `cycleIndex` 是当前分钟属于第几个周期（云环境每 5 分钟 = 1 个周期，第 0 分钟周期 0，第 5 分钟周期 1 …）
+- `serverHash` 是服务器 ID 的 CRC32 哈希，每个服务器分到一个固定的偏移量
+- `(cycleIndex + serverHash) % interval !== 0` 表示当前周期轮不到这台服务器
+
+**实际检查间隔对照表**：
+
+| unreachable_count | 间隔（周期倍数） | 自建环境（1min/周期） | 云环境（5min/周期） |
+|--------------------|----------------|----------------------|---------------------|
+| 0-2 | 1 周期 | ~1 分钟 | ~5 分钟 |
+| 3-5 | 3 周期 | ~3 分钟 | ~15 分钟 |
+| 6-11 | 6 周期 | ~6 分钟 | ~30 分钟 |
+| 12+ | 12 周期 | ~12 分钟 | ~60 分钟 |
+
+**设计意图**：
+- 自建环境服务器少，检查频率高（每分钟）
+- 云环境服务器多，检查频率低（每 5 分钟），减少 SSH 连接风暴
+- 哈希分散确保同一时刻不会所有服务器同时检查，负载平均分布
+- 退避用周期倍数而非绝对时间，两套环境复用同一套退避逻辑
+
 ### 可达性变更事件
 
 [ServerReachabilityChanged](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Events/ServerReachabilityChanged.php#L8-L17) 在构造函数中直接调用 `server->isReachableChanged()`：
@@ -74,6 +147,39 @@
 - 服务器不可达 + `unreachable_count >= 2` + 尚未发过通知 → 发送不可达通知
 
 阈值为 2：单次抖动不触发通知，连续 2 次不可达才发。
+
+#### 构造即副作用：反 Laravel 惯例的设计
+
+[ServerReachabilityChanged](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Events/ServerReachabilityChanged.php#L8-L17) 的设计**违反了 Laravel 的惯例**：
+
+```php
+public function __construct(public readonly Server $server)
+{
+    $this->server->isReachableChanged();
+}
+```
+
+**Laravel 惯例**：Event 类应该是**纯数据载体**（DTO），只承载事件相关的属性，不应该有副作用。副作用（发通知、写数据库操作应该在 Listener 里做。
+
+**这里的做法**：构造函数里直接调用 `isReachableChanged()`——相当于把「判定要不要发通知 + 更新通知 + 修改数据库」全都做了，整个事件的**没有 Listener，构造即执行。
+
+**为什么这么设计**（可能的权衡）：
+- 简单直接，不需要注册 Listener，代码少一个文件
+- `isReachableChanged()` 是个「检查方法，不需要事件是「判断逻辑封装在模型方法里，事件只是个触发点
+- 避免了 Listener → Listener 注册和 Listener 发现，保持模型方法里
+
+**代价**：
+- 不符合 Laravel 事件系统完全脱节了「事件 + Listener 的可扩展性差——想加新的 Listener 的副作用不——触发，构造函数里已经执行了
+- 测试困难——事件的语义被破坏了，「事件被 dispatch 了就一定会执行，就一定会产生副作用
+- 「事件」名不副实：它更像一个「动作」而不是「事件」
+
+调用位置：
+- [Server::validateConnection() 里 SSH 可达/不可达时 dispatch
+- [Team::forceDisableServer() 里手动强制禁用时 dispatch
+- [Livewire Server\Show] 里手动验证时 dispatch
+- [ValidateAndInstallServerJob] 安装验证时 dispatch
+
+总共 4 个 dispatch 点，全部都是「触发后直接执行副作用。
 
 ---
 
@@ -141,6 +247,25 @@ if ($sentinelOutOfSync) {
 - 首次推送 / hash 变化 / 强制窗口过期（默认 300 秒）→ 派发
 - hash 未变 + 强制窗口未过期 → 跳过（避免每分钟都做重量级数据库操作）
 
+#### auditLog 记录路径
+
+Sentinel push 的成功和失败都有审计日志，走不同的 log channel。
+
+**成功日志**：`auditLog('sentinel.metrics_pushed', ...)` — 走 `audit` channel，级别 info
+- 位置：[SentinelController::push() 末尾](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Http/Controllers/Api/SentinelController.php#L102-L105)
+- 记录内容：`event`, `ip`, `ua`, `user_id`, `user_email`, `team_id`, `token_id`, `token_name`, `method`, `path`, `server_uuid`, `team_id`
+
+**失败日志**：`auditLogWebhookFailure('sentinel', $reason, ...)` — 走 `audit` channel，级别 warning
+- 位置：每个 401/404 错误分支都有
+- 失败原因包括：`token_missing`, `decrypt_failed`, `invalid_token_payload`, `server_not_found`, `subscription_unpaid`, `server_not_functional`, `token_mismatch`
+- 每次失败都记录 `reason` + `ip` + `ua` + `method` + `path` + 上下文
+
+**auditLog 实现**（[audit.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/bootstrap/helpers/audit.php#L16-L46)）：
+- 通过 `Log::channel('audit')` 写入独立的审计日志通道
+- 失败安全：审计日志本身出错不会影响主请求流程，catch 后用 warning 兜底
+- 自动附加：IP、UA、用户 ID、token 信息、HTTP 方法、路径等上下文
+- webhook 失败用 `warning` 级别，正常事件用 `info` 级别
+
 #### shouldDispatchUpdate 的 Cache::lock 分布式锁细节
 
 `shouldDispatchUpdate` 不是简单地读缓存比 hash，而是用 `Cache::lock($lockKey, 10)->block(5, ...)` 加分布式锁保护整个「读 hash → 判定 → 写缓存」的 read-modify-write 序列。
@@ -151,6 +276,42 @@ if ($sentinelOutOfSync) {
 - 持有时间 10 秒：足够完成缓存读写（纯内存操作，实际 <1ms），留 10 秒是为了应对 Redis 延迟等异常
 - 阻塞等待 5 秒：超过 5 秒还拿不到锁 → 捕获 `LockTimeoutException` → 返回 `false` → 这次推送直接跳过不派发
 - 跳过策略：拿不到锁就放弃，不重试。因为 Sentinel 每分钟推送一次，漏一次不影响，下次推送自然会补上。宁可少派一次，绝不多派一次。
+
+#### 两套 lock/节流的差异：Cache::lock vs shouldRunCronNow
+
+系统中有两种完全不同的「去重/节流」机制，分别用在不同的场景，容易混淆：
+
+| 维度 | Cache::lock（Sentinel push 去重） | shouldRunCronNow（ServerManager 调度节流） |
+|------|----------------------------------|--------------------------------------------|
+| 位置 | [SentinelController::shouldDispatchUpdate()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Http/Controllers/Api/SentinelController.php#L116-L141) | [shared.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/bootstrap/helpers/shared.php#L675-L696) |
+| 本质 | 互斥锁（Mutex）——同一时刻只能一个进 | 周期性调度去重——同一 cron 周期内只触发一次 |
+| 解决的问题 | 并发请求同时读写同一缓存导致重复 dispatch | 同一 cron 周期内多次调用导致重复 dispatch |
+| 粒度 | 每服务器 1 把锁 | 每服务器每任务 1 个 dedup key（如 `server-check:123`） |
+| 超时/持有时间 | lock 10s，block 等待 5s | 30 天 TTL（远超所有周期），存 ISO8601 时间戳 |
+| 判定逻辑 | 拿不到锁 → 跳过（返回 false） | 上次执行时间 < 当前周期的 due 时间 → 触发 |
+| 失败策略 | 超时就放弃，绝不重复派发 | 永远写入缓存，seed/refresh 都做，确保不漏 |
+| 数据一致性 | 强一致（同一时刻只有一个执行者） | 最终一致（同一周期内只触发一次） |
+| 典型场景 | HTTP 请求并发推送，同一秒多个请求 | 每分钟定时 Job，同一分钟内多次被调用 |
+
+**为什么需要两套**：
+- `Cache::lock` 解决**并发竞争**——同一个服务器的两次推送同时到达，争用同一个缓存键
+- `shouldRunCronNow` 解决**周期去重**——同一个 cron 周期内（如同一个小时、同一天），同一项任务只触发一次，不管 ServerManagerJob 被调用了多少次
+
+**调用方式的差异**：
+```php
+// Cache::lock —— 互斥，保护临界区
+Cache::lock($key, 10)->block(5, function () {
+    // 临界区代码：读 → 判断 → 写
+});
+
+// shouldRunCronNow —— 幂等，同一周期内多次调用只返回一次 true
+shouldRunCronNow('0 0 * * *', $timezone, "task:{$server->id}", $executionTime);
+```
+
+**在 ServerManagerJob 中的实际应用**：
+- `dispatchConnectionChecks`：全局共用一个 dedup key `server-connection-checks`，所有服务器一起判断
+- `processServerTasks`：每个任务每个服务器一个 dedup key，如 `server-check:{id}`, `sentinel-restart:{id}`, `server-storage-check:{id}`, `server-patch-check:{id}`
+- `sentinelOutOfSync` 是额外的前置判断——Sentinel 心跳正常的服务器，连 shouldRunCronNow 都不用调，直接跳过
 
 #### Force Window 的真实意图
 
@@ -283,7 +444,77 @@ Sentinel 推送（每 60s）
 
 每一级都在过滤噪声，最终用户收到高磁盘告警的频率被严格控制在每小时最多 1 次。
 
+#### 超时清 Horizon failed：静默失败的设计
+
+[ServerStorageCheckJob::failed()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Jobs/ServerStorageCheckJob.php#L32-L43) 有一个特殊的失败处理：
+
+```php
+public function failed(?\Throwable $exception): void
+{
+    if ($exception instanceof \Illuminate\Queue\TimeoutExceededException) {
+        Log::warning('ServerStorageCheckJob timed out', [...]);
+        // Delete the queue job so it doesn't appear in Horizon's failed list.
+        $this->job?->delete();
+    }
+}
+```
+
+**设计意图**：超时是一种「预期内的失败」——服务器 SSH 慢、网络抖动等都可能导致超时。这类失败不应该出现在 Horizon 的 failed jobs 列表里污染视图，也不需要人工介入。
+
+**具体行为**：
+- 只有 `TimeoutExceededException`（超时异常）才会触发 delete
+- 其他异常（如逻辑错误、配置错误等）仍然正常进入 failed 列表
+- 超时失败只写一条 warning 日志到默认 channel
+- `$tries = 1` + `timeout = 60`，超时后直接标记失败，不重试
+- backoff 1~3 秒，但因为 tries=1，backoff 实际上不会生效
+
+**类似模式的 Job**：
+这种「超时即静默删除，不进 Horizon failed」的模式在 Coolify 中不是孤例，是一种针对「网络/IO 类预期内失败」的通用处理方式。
+
+**代价**：
+- 开发者如果只看 Horizon failed 列表，可能看不到超时失败的问题
+- 需要通过日志监控才能发现超时率上升的趋势
+- 属于「用可观测性换用户体验」的权衡——不让用户看到预期内的失败
+
 > **Swarm 不支持**：`PushServerUpdateJob` 开头有 `// TODO: Swarm is not supported yet`，Swarm 集群只能通过 SSH 路径 (ServerCheckJob) 获取容器状态。
+
+### 其他周期任务：ServerPatchCheckJob 周日扫描
+
+ServerManagerJob 的 `processServerTasks` 里还有一个独立的周期性任务——[ServerPatchCheckJob](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Jobs/ServerPatchCheckJob.php#L16-L68)，每周日零点执行。
+
+**调度条件**：
+```php
+$shouldRunPatchCheck = shouldRunCronNow('0 0 * * 0', $serverTimezone,
+    "server-patch-check:{$server->id}", $this->executionTime);
+```
+- 每周日凌晨 0 点触发
+- 每服务器一个 dedup key，确保只触发一次
+- **不受 Sentinel 心跳状态影响**——不管 Sentinel 是否在线，每周都跑一次
+
+**任务参数**：
+- `$tries = 3` — 失败后重试 3 次（不同于其他 Job 的 tries=1）
+- `$timeout = 600` — 10 分钟超时（检查系统更新可能比较慢）
+- 中间件：`WithoutOverlapping('server-patch-check-'.$server->uuid)` — 每服务器不重叠执行，600 秒后自动释放锁，`dontRelease()` 表示重叠时不重新入队，直接丢弃
+
+**执行流程**（[ServerPatchCheckJob::handle()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Jobs/ServerPatchCheckJob.php#L31-L67)）：
+
+1. `$server->serverStatus() === false` → 服务器不在线 → 直接返回，不报错
+2. 没 team → 直接返回
+3. 调用 `CheckUpdates::run($server)` 检查系统更新
+4. 有 error（如检查失败）→ 发通知 + 返回
+5. `total_updates > 0` → 发 ServerPatchCheck 通知告知有更新待安装
+6. 异常被 catch 住，只记 error 日志，不标记任务失败（`tries=3` 实际上由 Laravel 队列机制处理）
+
+**设计特点**：
+- **低优先级、低频**：每周一次，不急
+- **容忍失败**：检查失败只发通知，不重试不休眠，服务器离线直接跳过
+- **不重叠**：上一周没跑完的话，这周不会重复跑
+- **有更新才通知**：系统已是最新版本时不打扰用户
+
+**与 Sentinel 的关系**：
+- 完全独立，不依赖 Sentinel 推送
+- SSH 路径执行，所以 Swarm 也能跑
+- 跟状态轮询、Sentinel 启动都没关系，是纯粹的系统维护任务
 
 ---
 
@@ -374,6 +605,57 @@ if ($shouldRestartSentinel) {
 6. 执行远程命令：删除旧容器 → 创建目录 → 启动新容器 → 修复权限
 7. 更新数据库：`is_sentinel_enabled = true` + `sentinelHeartbeat()`
 8. 广播 `SentinelRestarted` 事件（通知前端 UI）
+
+#### Sentinel API 边车自洽点
+
+Sentinel 容器本身是一个独立的边车（sidecar）进程，监听 `127.0.0.1:8888`，提供自己的 HTTP API。它的健康和版本管理都是**自洽**的——不依赖 Coolify 主动探测，靠 Docker 健康检查和自身 API 完成闭环。
+
+**自洽点 1：Docker health check 用自己的 API**
+
+[StartSentinel 的 docker run](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Actions/Server/StartSentinel.php#L54) 配置：
+
+```bash
+--health-cmd "curl --fail http://127.0.0.1:8888/api/health || exit 1"
+--health-interval 10s
+--health-retries 3
+```
+
+- Docker 每 10 秒调用一次 Sentinel 自己的 `/api/health` 端点
+- 连续 3 次失败 → Docker 标记容器为 `unhealthy`
+- 这是容器级别的自监控——Sentinel 自己的健康状况由 Docker 自动检测，不需要 Coolify 参与
+
+**自洽点 2：版本检查用自己的 API**
+
+[CheckAndStartSentinelJob](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Jobs/CheckAndStartSentinelJob.php#L36) 获取运行中版本：
+
+```php
+$runningVersion = instant_remote_process_with_timeout(
+    ['docker exec coolify-sentinel sh -c "curl http://127.0.0.1:8888/api/version"'],
+    $this->server, false
+);
+```
+
+- 通过 `docker exec` 在容器内 curl 自己的 `/api/version`
+- 不暴露端口给外部，全部在容器内部闭环
+- 版本号用来和最新版本对比，决定是否需要更新
+
+**自洽点 3：边车只监听本机，不对外暴露**
+
+- Sentinel API 只绑定 `127.0.0.1:8888`，只在容器内可访问
+- Coolify 不直接调用 Sentinel API，靠 Sentinel 主动推送数据（push 模式）
+- 版本检查用 `docker exec` 绕进去，不映射端口
+- 安全：没有额外的端口暴露到公网，减小攻击面
+
+**整体自洽架构**：
+```
+Coolify 控制面 ←── push ── Sentinel 边车（127.0.0.1:8888）
+     │                      │    │
+     └── StartSentinel ─────┘    └── Docker health check（自监控）
+         CheckAndStartSentinel        /api/health（自检测）
+         docker exec curl             /api/version（自报告）
+```
+
+Sentinel 作为边车，自己管自己的健康、自己管自己的版本、自己推送数据。Coolify 只负责启动和接收推送，不需要主动轮询边车状态。这是典型的 sidecar 自洽设计。
 
 #### ServerSetting 创建期 token 与 URL 自动生成
 
@@ -876,14 +1158,22 @@ if ($this->containers->isEmpty()) {
 6. **hash 粗粒度 vs status 细粒度**：hash 只取 `name+state` 去重，status 写入 `state:health` 展示，二者语义不同——大事实时响应，小事定期刷新
 7. **磁盘三级防抖链**：推送阈值边沿 → 10 分钟数值变化去重 → 1 小时 RateLimiter 通知，层层过滤噪声
 8. **Cache::forget 跨阈值重置**：磁盘降到阈值以下时立即清缓存，确保下次上升沿一定能触发，不会漏掉
-9. **退避策略**：不可达次数越多检查越稀疏，使用哈希分散避免惊群
-10. **崩溃自愈**：Sentinel 失同步 → SSH 轮询 → 发现 Sentinel 挂 → 自动重启
-11. **配置热重载全链**：ServerSetting updated 事件 → restartSentinel() → StartSentinel(dispatch) → StopSentinel(sync) + docker run + heartbeat + broadcast
-12. **创建期静默初始化**：ServerSetting creating 事件自动生成 token 和 URL，用 `saveQuietly()` 不触发 updated 事件，避免刚创建就重启
-13. **字符白名单防注入**：`isValidSentinelToken` 用正则 `[a-zA-Z0-9._\-+=\/]` 限制 token 字符集，拼 shell 命令时无注入风险
-14. **isFunctional 的 ssh-mux 清理**：服务器不可操作时删除多路复用控制文件，防止僵死连接
-15. **快速失败部署**：服务器不可用时部署任务立即失败，不阻塞队列
-16. **队列容量限制**：每服务器 `deployment_queue_limit`（默认 25）防堆积
-17. **空容器列表保护**：PushServerUpdateJob 中容器列表为空时不标记资源 exited，防误判
-18. **最终清理**：7 天不可达服务器自动禁用，防止永远重试已离线服务器
-19. **云端付费校验**：Sentinel push 在云环境校验订阅付费状态，未付费返回 401
+9. **退避分粒度时序**：自建 1min/周期、云环境 5min/周期，退避用周期倍数而非绝对时间，两套环境复用同一套逻辑
+10. **哈希分散避惊群**：`crc32(server_id)` 分配检查槽位，同一时刻不会所有服务器同时检查
+11. **两套 lock/节流机制**：Cache::lock 解决并发竞争（同一时刻互斥），shouldRunCronNow 解决周期去重（同一周期内幂等），用途完全不同
+12. **超时清 Horizon failed**：TimeoutExceededException 时 `$this->job->delete()` 静默失败，预期内失败不进 failed 列表
+13. **崩溃自愈**：Sentinel 失同步 → SSH 轮询 → 发现 Sentinel 挂 → 自动重启
+14. **配置热重载全链**：ServerSetting updated 事件 → restartSentinel() → StartSentinel(dispatch) → StopSentinel(sync) + docker run + heartbeat + broadcast
+15. **创建期静默初始化**：ServerSetting creating 事件自动生成 token 和 URL，用 `saveQuietly()` 不触发 updated 事件，避免刚创建就重启
+16. **字符白名单防注入**：`isValidSentinelToken` 用正则 `[a-zA-Z0-9._\-+=\/]` 限制 token 字符集，拼 shell 命令时无注入风险
+17. **Sentinel API 边车自洽**：Docker health check 调自己的 /api/health，版本检查调自己的 /api/version，只监听 127.0.0.1，安全不暴露
+18. **auditLog 双通道**：成功走 info 级别、失败走 auditLogWebhookFailure 的 warning 级别，都进 audit channel，失败安全绝不打断主流程
+19. **构造即副作用的 Event**：ServerReachabilityChanged 在构造函数里直接执行 isReachableChanged()，没有 Listener，反 Laravel 惯例但更简单
+20. **ServerPatchCheckJob 周日扫描**：每周日零点检查系统更新，tries=3、timeout=600s、WithoutOverlapping 不重叠，服务器离线直接跳过
+21. **Console Kernel dev/prod 双轨制**：dev 环境去掉了所有 cleanup 类任务（unreachable-servers/database/preview 清理/redis 锁/sanctum 过期），只保留核心调度，避免开发时数据被清
+22. **isFunctional 的 ssh-mux 清理**：服务器不可操作时删除多路复用控制文件，防止僵死连接
+23. **快速失败部署**：服务器不可用时部署任务立即失败，不阻塞队列
+24. **队列容量限制**：每服务器 `deployment_queue_limit`（默认 25）防堆积
+25. **空容器列表保护**：PushServerUpdateJob 中容器列表为空时不标记资源 exited，防误判
+26. **最终清理**：7 天不可达服务器自动禁用，防止永远重试已离线服务器
+27. **云端付费校验**：Sentinel push 在云环境校验订阅付费状态，未付费返回 401
