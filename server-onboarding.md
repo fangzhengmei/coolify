@@ -226,39 +226,160 @@ return [
 ```php
 public function validateDockerEngine($throwError = false)
 {
-    // 1. 检查 docker 二进制是否存在
-    $dockerBinary = instant_remote_process(['command -v docker'], ...);
+    $dockerBinary = instant_remote_process(['command -v docker'], $this, false, no_sudo: true);
     if (is_null($dockerBinary)) {
-        $this->settings->is_usable = false;  // 标记不可用
+        $this->settings->is_usable = false;
+        $this->settings->save();   // 置位后立即落库
+        if ($throwError) {
+            throw new \Exception('Server is not usable. Docker Engine is not installed.');
+        }
         return false;
     }
-    // 2. 检查 Docker 是否正常运行
     try {
         instant_remote_process(['docker version'], $this);
     } catch (\Throwable $e) {
-        $this->settings->is_usable = false;  // 标记不可用
+        $this->settings->is_usable = false;
+        $this->settings->save();   // 置位后立即落库
+        if ($throwError) {
+            throw new \Exception('Server is not usable. Docker Engine is not running.');
+        }
         return false;
     }
-    // 3. 成功: 标记可用，创建网络
     $this->settings->is_usable = true;
-    $this->validateCoolifyNetwork(...);
+    $this->settings->save();       // 置位后立即落库
+    $this->validateCoolifyNetwork(isSwarm: false, isBuildServer: $this->settings->is_build_server);
     return true;
 }
 ```
 
-**校验结果 → 状态字段** 对应关系：
+#### 3.3.1 完整分支与状态字段行为
 
-| 校验结果 | `settings.is_usable` | 副作用 |
-|---------|---------------------|--------|
-| Docker 二进制不存在 | `false` | - |
-| Docker 未运行 | `false` | - |
-| Docker 正常运行 | `true` | 创建 `coolify` 网络 |
+方法有 3 条退出路径，**每条路径都是"置位 → save() 落库 → return"的固定模式**，没有条件判断：
+
+**路径 A：Docker 二进制不存在**（[L1322-L1331](file:///d:/fz/0601-1/solo-dogfeeding/code/93-coolify/app/Models/Server.php#L1322-L1331)）
+
+`command -v docker` 返回 null → `is_usable = false` → `save()` 落库 → `return false`
+
+| 操作 | 代码行 | 写入字段 | 写入值 | 是否落库 |
+|-----|--------|---------|-------|---------|
+| 置位 | L1324 | `settings.is_usable` | `false` | — |
+| 落库 | L1325 | `server_settings` 表 | — | `save()` 写入数据库 |
+
+语义：Docker 未安装。
+
+**路径 B：Docker 已安装但未运行**（[L1332-L1342](file:///d:/fz/0601-1/solo-dogfeeding/code/93-coolify/app/Models/Server.php#L1332-L1342)）
+
+`command -v docker` 返回路径 → `docker version` 抛异常 → `is_usable = false` → `save()` 落库 → `return false`
+
+| 操作 | 代码行 | 写入字段 | 写入值 | 是否落库 |
+|-----|--------|---------|-------|---------|
+| 置位 | L1335 | `settings.is_usable` | `false` | — |
+| 落库 | L1336 | `server_settings` 表 | — | `save()` 写入数据库 |
+
+语义：Docker 已安装但守护进程未启动。与路径 A 虽然都写 `is_usable = false`，但原因不同。
+
+**路径 C：Docker 正常运行**（[L1343-L1347](file:///d:/fz/0601-1/solo-dogfeeding/code/93-coolify/app/Models/Server.php#L1343-L1347)）
+
+上述检查均通过 → `is_usable = true` → `save()` 落库 → `validateCoolifyNetwork()` → `return true`
+
+| 操作 | 代码行 | 写入字段 | 写入值 | 是否落库 |
+|-----|--------|---------|-------|---------|
+| 置位 | L1343 | `settings.is_usable` | `true` | — |
+| 落库 | L1344 | `server_settings` 表 | — | `save()` 写入数据库 |
+| 副作用 | L1345 | 创建 `coolify` Docker 网络 | — | 仅非构建服务器时 |
+
+#### 3.3.2 三条路径汇总
+
+| 路径 | 触发条件 | `settings.is_usable` | `settings.save()` 落库 | 副作用 |
+|-----|---------|---------------------|----------------------|--------|
+| A: 二进制不存在 | `command -v docker` 返回 null | `false` | 调用 | 无 |
+| B: 引擎未运行 | `docker version` 抛异常 | `false` | 调用 | 无 |
+| C: 正常运行 | 上述检查均通过 | `true` | 调用 | `validateCoolifyNetwork` 创建网络 |
+
+**与 `validateConnection` 的关键区别**：
+- `validateConnection`：**条件性**落库，仅在 `is_reachable` 值真正变化时才 `save()` + 广播
+- `validateDockerEngine`：**无条件**落库，每次调用必然 `save()`，不管旧值是什么
+- `validateDockerEngine` 没有 `ServerReachabilityChanged` 广播
+
+**`throwError` 参数说明**：
+- 默认 `false`，`ValidateAndInstallServerJob` 中未传此参数
+- 仅在 `ValidateServer` Action 中传入 `throwError = true`，失败时抛异常而非返回 `false`
 
 ### 3.4 Docker Compose 校验
 
 **代码位置**: [Server::validateDockerCompose()](file:///d:/fz/0601-1/solo-dogfeeding/code/93-coolify/app/Models/Server.php#L1350-L1366)
 
-执行 `docker compose version` 检查。
+```php
+public function validateDockerCompose($throwError = false)
+{
+    $dockerCompose = instant_remote_process(['docker compose version'], $this, false);
+    if (is_null($dockerCompose)) {
+        $this->settings->is_usable = false;
+        $this->settings->save();   // 置位后立即落库
+        if ($throwError) {
+            throw new \Exception('Server is not usable. Docker Compose is not installed.');
+        }
+        return false;
+    }
+    $this->settings->is_usable = true;
+    $this->settings->save();       // 置位后立即落库
+    return true;
+}
+```
+
+#### 3.4.1 完整分支与状态字段行为
+
+方法有 2 条退出路径，与 `validateDockerEngine` 一样是**无条件落库**：
+
+**路径 A：Docker Compose 不存在**（[L1352-L1361](file:///d:/fz/0601-1/solo-dogfeeding/code/93-coolify/app/Models/Server.php#L1352-L1361)）
+
+`docker compose version` 返回 null → `is_usable = false` → `save()` 落库 → `return false`
+
+| 操作 | 代码行 | 写入字段 | 写入值 | 是否落库 |
+|-----|--------|---------|-------|---------|
+| 置位 | L1354 | `settings.is_usable` | `false` | — |
+| 落库 | L1355 | `server_settings` 表 | — | `save()` 写入数据库 |
+
+**路径 B：Docker Compose 已安装**（[L1362-L1365](file:///d:/fz/0601-1/solo-dogfeeding/code/93-coolify/app/Models/Server.php#L1362-L1365)）
+
+`docker compose version` 返回版本号 → `is_usable = true` → `save()` 落库 → `return true`
+
+| 操作 | 代码行 | 写入字段 | 写入值 | 是否落库 |
+|-----|--------|---------|-------|---------|
+| 置位 | L1362 | `settings.is_usable` | `true` | — |
+| 落库 | L1363 | `server_settings` 表 | — | `save()` 写入数据库 |
+
+#### 3.4.2 两条路径汇总
+
+| 路径 | 触发条件 | `settings.is_usable` | `settings.save()` 落库 |
+|-----|---------|---------------------|----------------------|
+| A: 不存在 | `docker compose version` 返回 null | `false` | 调用 |
+| B: 已安装 | 命令返回版本号 | `true` | 调用 |
+
+**与 `validateDockerEngine` 的对比**：
+- 只有 2 条路径，没有"已安装但未运行"的中间状态
+- 同样无条件 `save()` 落库
+- 没有 `validateCoolifyNetwork` 副作用
+- `throwError` 参数用法相同，`ValidateAndInstallServerJob` 中未使用
+
+#### 3.4.3 两个方法在 Job 中的交互
+
+在 [ValidateAndInstallServerJob](file:///d:/fz/0601-1/solo-dogfeeding/code/93-coolify/app/Jobs/ValidateAndInstallServerJob.php#L114-L145) 中，两个方法依次调用：
+
+```php
+$dockerInstalled = $this->server->validateDockerEngine();     // 第一次 is_usable 写入
+$dockerComposeInstalled = $this->server->validateDockerCompose(); // 第二次 is_usable 写入
+```
+
+**`is_usable` 的值取决于最后执行的那次 `save()`**：
+
+| 场景 | validateDockerEngine | validateDockerCompose | 最终 `is_usable` |
+|-----|---------------------|----------------------|-----------------|
+| Docker 未安装 | `false` + save | 不执行（短路） | `false` |
+| Docker 运行 + Compose 不存在 | `true` + save | `false` + save | `false` |
+| Docker 运行 + Compose 已安装 | `true` + save | `true` + save | `true` |
+
+**注意**：当 Docker 运行但 Compose 不存在时，`is_usable` 会被 `validateDockerCompose` 从 `true` 覆写为 `false`，两次 `save()` 都会执行。
 
 ### 3.5 Docker 安装
 
