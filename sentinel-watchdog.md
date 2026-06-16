@@ -141,6 +141,86 @@ if ($sentinelOutOfSync) {
 - 首次推送 / hash 变化 / 强制窗口过期（默认 300 秒）→ 派发
 - hash 未变 + 强制窗口未过期 → 跳过（避免每分钟都做重量级数据库操作）
 
+#### shouldDispatchUpdate 的 Cache::lock 分布式锁细节
+
+`shouldDispatchUpdate` 不是简单地读缓存比 hash，而是用 `Cache::lock($lockKey, 10)->block(5, ...)` 加分布式锁保护整个「读 hash → 判定 → 写缓存」的 read-modify-write 序列。
+
+**为什么需要锁**：Sentinel 推送间隔很短（默认 60s），在多实例部署（Horizon 多 worker）下，同一个服务器的两次推送可能在不同 web 进程中几乎同时到达。如果不加锁，两个并发请求会同时读到旧 hash，都判定需要 dispatch，产生「同时派发两个 PushServerUpdateJob，浪费数据库资源，甚至可能产生重复的状态更新竞争。
+
+**锁的参数**：
+- 持有时间 10 秒：足够完成缓存读写（纯内存操作，实际 <1ms），留 10 秒是为了应对 Redis 延迟等异常
+- 阻塞等待 5 秒：超过 5 秒还拿不到锁 → 捕获 `LockTimeoutException` → 返回 `false` → 这次推送直接跳过不派发
+- 跳过策略：拿不到锁就放弃，不重试。因为 Sentinel 每分钟推送一次，漏一次不影响，下次推送自然会补上。宁可少派一次，绝不多派一次。
+
+#### Force Window 的真实意图
+
+强制窗口（force window / push_force_interval_seconds，默认 300 秒）有两个 Cache key：
+
+- `sentinel:push-hash:{server_id}` → 存上次派发过的状态 hash，TTL 1 天
+- `sentinel:push-force:{server_id}` → 存一个布尔标记，TTL = 强制窗口时长
+
+**判定逻辑**：
+```php
+$shouldDispatch = $cachedHash === null    // 首次推送
+    || $cachedHash !== $hash             // 状态真的变了
+    || !$forceActive;                   // 强制窗口过期了
+```
+
+**Force window 存在的真实意图**不是「定期刷新状态数据」——那是附带效果，而是**防漏检的安全网**。因为 hash 只比较 `name + state`，但 PushServerUpdateJob 里实际处理的内容远不止 state（还有健康状态、磁盘使用率、Proxy 连接网络等）。如果只靠 hash 变化触发，有两类变化会永远被漏掉：
+
+1. **容器状态没变但健康状态在变（health_status 不进 hash）
+2. **非容器的变化（磁盘使用率波动、Proxy 网络重连等）
+
+强制窗口保证：即使状态 hash 完全没变，最多 5 分钟也会强制派发一次，确保那些没被 hash 捕捉到的变化也能最终同步到数据库。这是「eventual consistency via periodic refresh 的典型设计。
+
+**两个 key 不同的 TTL 设计**：
+- hash key TTL 1 天：服务器停推 1 天后缓存才过期，因为 1 天内恢复推送如果状态不变也不浪费。1 天是上限兜底，防止服务器永久失联后缓存永久占用内存。
+- force key TTL = 窗口时长（300s）：每隔窗口过期一次，过期后下一次推送必然触发强制刷新。
+
+**派发后的写入顺序**：先写 hash → 再写 force key（重置窗口计时起点。这样保证每次 dispatch 后，force 窗口从最近一次 dispatch 开始重新计时，而不是从任意时间点。
+
+#### 容器 status 写入 state:health 拼接与 hash 只取 state 的语义差
+
+Sentinel 推送的每个容器有两个独立但相关的字段：`state`（容器生命周期状态）和 `health_status`（健康检查状态）。在写入数据库和计算 hash 时，这两个字段的处理方式截然不同。
+
+**写入数据库：state:health 拼接**
+
+[PushServerUpdateJob.php#L222-L227](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Jobs/PushServerUpdateJob.php#L222-L227)：
+
+```php
+$rawHealthStatus = data_get($container, 'health_status');
+$containerHealth = $rawHealthStatus ?? 'unknown';
+// Only append health status if container is not exited
+if ($containerStatus !== 'exited') {
+    $containerStatus = "$containerStatus:$containerHealth";
+}
+```
+
+拼接规则：
+- 容器 `exited` 时 → status 就是 `"exited"`（不加 health，因为死了不需要健康检查）
+- 容器非 exited 时 → status 是 `"running:healthy"` 或 `"running:unhealthy"` 或 `"running:starting"` 或 `"running:unknown"`
+
+这个拼接后的字符串被直接写入 `applications.status`、`databases.status`、`services.applications.status` 等字段，作为前端展示和业务判定的最终状态。
+
+**计算 hash：只取 state**
+
+[containerStateHash()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Http/Controllers/Api/SentinelController.php#L154-L166) 只取 `name + state`，完全忽略 `health_status`。
+
+**为什么要有这个语义差？核心原因有三个：**
+
+1. **health_status 波动太频繁**：健康检查可以是每 10 秒甚至更短间隔，状态可能在 `starting` → `healthy` → `unhealthy` → `healthy` 之间来回跳。如果 hash 包含 health_status，那每次健康检查状态变化都会触发 PushServerUpdateJob，每分钟可能产生多次 dispatch，完全失去去重意义。
+
+2. **业务优先级不同**：`state` 代表容器生命周期（created / running / paused / exited / dead），是**容器存在性**的核心指标——容器在不在、跑没跑。`health_status` 是**服务可用性**的附加指标——容器跑着但服务健康不健康。state 变化是「大事」（容器启了/停了），health 变化是「小事」（健康状况波动）。大事要实时响应（hash 变化立即 dispatch），小事可以延后合并（靠 force window 定期刷新）。
+
+3. **exited 的特殊处理**：exited 状态不加 health 后缀，这意味着只要容器退出了，不管之前是什么健康状态，统一表示为 `"exited"`。反过来，如果 hash 包含 health，exited 容器的 health（通常是 none / null）会造成 hash 抖动——容器刚退出时 health 可能还没清，之后又变成 none，导致额外的 dispatch。只取 state 避免了这个问题。
+
+**整体设计哲学**：
+- **hash（去重用）** → 粗粒度，只关心「容器有没有、跑没跑」→ 变化少，dispatch 少
+- **status（展示用）** → 细粒度，关心「跑着 + 健康不健康」→ 信息全，用户体验好
+- **force window** → 兜底机制，确保细粒度的 health 变化最多延迟 5 分钟也能同步到数据库
+
+这是典型的「采样频率和展示精度的权衡」——高频变化的 health 信息靠低频强制刷新来最终一致，而不是实时同步。
+
 [PushServerUpdateJob](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Jobs/PushServerUpdateJob.php#L41-L807) 的核心同步逻辑：
 
 1. 更新磁盘使用率 → 超阈值时派发 `ServerStorageCheckJob`
@@ -151,6 +231,57 @@ if ($sentinelOutOfSync) {
 6. 更新 Service 子资源状态
 7. 标记未找到的资源为 `exited`
 8. 检查 Proxy 和 Log Drain 容器
+
+#### 磁盘检查：阈值边沿 + 数值变化双重防抖与 Cache::forget 跨阈值重置
+
+PushServerUpdateJob 中磁盘使用率的处理不是简单地「超阈值就发通知」，而是有两层防抖 + 跨阈值重置。
+
+**判定逻辑**（[PushServerUpdateJob.php#L175-L189](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Jobs/PushServerUpdateJob.php#L175-L189)）：
+
+```php
+if ($filesystemUsageRoot !== null
+    && $filesystemUsageRoot >= $diskThreshold
+    && (string)$lastPercentage !== (string)$filesystemUsageRoot) {
+    Cache::put($storageCacheKey, $filesystemUsageRoot, 600);
+    ServerStorageCheckJob::dispatch($this->server, $filesystemUsageRoot);
+} elseif ($filesystemUsageRoot !== null && $filesystemUsageRoot < $diskThreshold) {
+    Cache::forget($storageCacheKey);
+}
+```
+
+**第一层防抖：阈值边沿触发（边沿检测）**
+- 只有磁盘使用率 `>= 阈值` 时才可能派发检查任务
+- 在阈值以下 (`< $diskThreshold`) 时不仅不派发，还 `Cache::forget($storageCacheKey)` 清除缓存
+- 效果：刚超过阈值的那一刻才触发，之后是否再触发取决于第二层防抖
+
+**第二层防抖：数值变化去重（同一边沿内的二次过滤）**
+- 同处于阈值以上时，只有百分比数值发生了变化（字符串比较），才会重新派发
+- 数值没变 → 不重复派发 → 节省队列资源
+- 缓存 TTL 600 秒（10 分钟）：存的是上次派发时的百分比数值
+
+**为什么要用字符串比较 `(string)$lastPercentage !== (string)$filesystemUsageRoot`**：
+- 磁盘使用率通常是整数百分比，但也可能是浮点数
+- 用严格字符串比较能避免因精度导致的重复触发（如 80.0 vs 80.00）
+- 也防止 `null` 和 `0` 的类型转换问题
+
+**Cache::forget 的跨阈值重置语义**：
+- 当磁盘从「超阈值」降到「阈值以下」时，立即 forget 缓存
+- 下次再超阈值时，因为缓存已清空，`$lastPercentage === null`，立即触发
+- 这叫「下降沿重置」——确保每次越过阈值上升沿都能被检测到，不会因为之前超阈值时的缓存而漏掉
+
+**整体效果**：
+- 阈值以上：数值每变化一次，最多派发一次 Job，10 分钟内同一数值只发一次
+- 阈值以下：清缓存，为下次上升沿做准备
+- 不会因为磁盘在阈值线附近 1% 来回波动而疯狂发通知（与 ServerStorageCheckJob 内的 RateLimiter 1 小时 1 次通知配合，形成三级防抖）
+
+**三级防抖链**：
+```
+Sentinel 推送（每 60s）
+  → PushServerUpdateJob 磁盘阈值边沿 + 数值变化去重（10min 窗口）
+    → ServerStorageCheckJob RateLimiter（1h 1次通知）
+```
+
+每一级都在过滤噪声，最终用户收到高磁盘告警的频率被严格控制在每小时最多 1 次。
 
 > **Swarm 不支持**：`PushServerUpdateJob` 开头有 `// TODO: Swarm is not supported yet`，Swarm 集群只能通过 SSH 路径 (ServerCheckJob) 获取容器状态。
 
@@ -243,6 +374,85 @@ if ($shouldRestartSentinel) {
 6. 执行远程命令：删除旧容器 → 创建目录 → 启动新容器 → 修复权限
 7. 更新数据库：`is_sentinel_enabled = true` + `sentinelHeartbeat()`
 8. 广播 `SentinelRestarted` 事件（通知前端 UI）
+
+#### ServerSetting 创建期 token 与 URL 自动生成
+
+Sentinel 的 token 和推送端点 URL 不是在启动时才临时生成的，而是在 ServerSetting 创建时就自动初始化了。
+
+[ServerSetting::booted()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/ServerSetting.php#L117-L130) 的 `creating` 事件：
+
+```php
+static::creating(function ($setting) {
+    if (str($setting->sentinel_token)->isEmpty()) {
+        $setting->generateSentinelToken(save: false, ignoreEvent: true);
+    }
+    if (str($setting->sentinel_custom_url)->isEmpty()) {
+        $setting->generateSentinelUrl(save: false, ignoreEvent: true);
+    }
+});
+```
+
+**token 生成**（[generateSentinelToken()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/ServerSetting.php#L189-L205)）：
+- 内容：`encrypt(json_encode(['server_uuid' => $this->server->uuid]))`
+- 用 Laravel 的 `encrypt()` 加密，密文由 `base64_encode(iv + tag + payload)` 组成
+- 结果是一串 `a-zA-Z0-9+/=` 的 Base64 字符（可能包含 `/` 和 `+` 和 `=`）
+
+**URL 生成**（[generateSentinelUrl()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/ServerSetting.php#L207-L230)），优先级从高到低：
+1. localhost 服务器 → `http://host.docker.internal:8000`
+2. InstanceSettings 有 fqdn → 用 fqdn
+3. 有 public_ipv4 → `http://{ipv4}:8000`
+4. 有 public_ipv6 → `http://{ipv6}:8000`
+
+`ignoreEvent: true` 的作用：创建期生成 token/URL 时用 `saveQuietly()` 保存，不触发 `updated` 事件，避免刚创建就触发 restartSentinel——因为这时候服务器上的 Sentinel 容器还根本不存在，重启没有意义。
+
+#### 字符白名单防 shell 注入
+
+`TOKEN` 和 `PUSH_ENDPOINT` 环境变量会通过命令行参数的形式传给 `docker run`，最终拼接到 shell 命令中执行。如果 token 或 URL 中包含特殊字符（如 `;`、`&`、`$`、空格等），可能造成命令注入。
+
+为此有两层防护：
+
+**第一层：token 字符白名单验证**（[isValidSentinelToken()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/ServerSetting.php#L148-L155)）：
+
+```php
+public static function isValidSentinelToken(?string $token): bool
+{
+    if ($token === null) { return false; }
+    return (bool)preg_match('/\A[a-zA-Z0-9._\-+=\/]+\z/', $token);
+}
+```
+
+白名单字符：`a-z`、`A-Z`、`0-9`、`.`、`_`、`-`、`+`、`=`、`/`
+
+这些字符都是** shell 安全**的——没有分号、没有与号、没有美元符、没有空格、没有反引号、没有管道符。即使被拼接到 shell 命令里也不会产生注入。
+
+**为什么是这些字符**：Laravel 的 `encrypt()` 输出是 base64 编码的密文（含 `+`、`/`、`=`），加上可能的前缀格式字符。白名单正好覆盖了加密 token 所有可能出现的字符，多一个都不行。
+
+**第二层：ensureValidSentinelToken 主动修正**（[ensureValidSentinelToken()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/ServerSetting.php#L162-L187)）：
+
+在 StartSentinel 启动前调用，做完整的校验链路：
+1. 尝试读取 `sentinel_token`（经过 encrypted cast 解密）
+2. 如果解密失败（DecryptException）→ token 无效
+3. 用白名单正则验证 token 是否合法
+4. 不合法 → 清空 raw attribute → `generateSentinelToken()` 重新生成
+5. 重新生成后再验证一次，还不行就抛 RuntimeException
+6. `ignoreEvent: true` 防止生成新 token 又触发 restartSentinel 死循环
+
+**为什么需要清空 raw attribute**：
+```php
+$attrs = $this->getAttributes();
+$attrs['sentinel_token'] = null;
+$this->setRawAttributes($attrs, true);
+```
+因为 `sentinel_token` 有 `encrypted` cast，如果直接赋值再保存，Eloquent 的脏检查会读取原值（那个解不开密的坏值），解密失败导致异常。直接改 raw attributes 绕过了 cast 的脏检查。
+
+**整体安全链路**：
+```
+创建期自动生成 token → 白名单字符集（encrypt 输出天然符合）
+                        ↓
+启动前 ensureValidSentinelToken → 白名单校验 → 不合法就重生成
+                        ↓
+docker run -e TOKEN="$token" ... → 拼接进 shell 命令，安全无注入风险
+```
 
 ---
 
@@ -661,13 +871,19 @@ if ($this->containers->isEmpty()) {
 1. **心跳驱动的 SSH 短路**：Sentinel 心跳存活时跳过 SSH 连接检查，大幅减少 SSH 连接数
 2. **双重状态轮询（互斥）**：Sentinel 推送（轻量、高频）+ SSH 轮询（重量、低频、仅失同步时），二者互斥，Swarm 仅支持 SSH 路径
 3. **isSentinelEnabled 是 OR 组合**：`isMetricsEnabled() || isServerApiEnabled()`，`is_sentinel_enabled` 只是子开关而非总开关
-4. **去重推送**：容器状态 hash + 强制窗口，避免每分钟执行重量级数据库操作
-5. **退避策略**：不可达次数越多检查越稀疏，使用哈希分散避免惊群
-6. **崩溃自愈**：Sentinel 失同步 → SSH 轮询 → 发现 Sentinel 挂 → 自动重启
-7. **配置热重载全链**：ServerSetting updated 事件 → restartSentinel() → StartSentinel(dispatch) → StopSentinel(sync) + docker run + heartbeat + broadcast
-8. **isFunctional 的 ssh-mux 清理**：服务器不可操作时删除多路复用控制文件，防止僵死连接
-9. **快速失败部署**：服务器不可用时部署任务立即失败，不阻塞队列
-10. **队列容量限制**：每服务器 `deployment_queue_limit`（默认 25）防堆积
-11. **空容器列表保护**：PushServerUpdateJob 中容器列表为空时不标记资源 exited，防误判
-12. **最终清理**：7 天不可达服务器自动禁用，防止永远重试已离线服务器
-13. **云端付费校验**：Sentinel push 在云环境校验订阅付费状态，未付费返回 401
+4. **去重推送（分布式锁保护）**：`Cache::lock(10s)->block(5s)` 保护 read-modify-write 序列，拿不到锁就跳过（宁可少派一次，绝不多派一次）
+5. **force window 是漏检安全网**：hash 只抓 state 变化，health/disk/proxy 等变化靠 300s 强制窗口兜底，实现最终一致性
+6. **hash 粗粒度 vs status 细粒度**：hash 只取 `name+state` 去重，status 写入 `state:health` 展示，二者语义不同——大事实时响应，小事定期刷新
+7. **磁盘三级防抖链**：推送阈值边沿 → 10 分钟数值变化去重 → 1 小时 RateLimiter 通知，层层过滤噪声
+8. **Cache::forget 跨阈值重置**：磁盘降到阈值以下时立即清缓存，确保下次上升沿一定能触发，不会漏掉
+9. **退避策略**：不可达次数越多检查越稀疏，使用哈希分散避免惊群
+10. **崩溃自愈**：Sentinel 失同步 → SSH 轮询 → 发现 Sentinel 挂 → 自动重启
+11. **配置热重载全链**：ServerSetting updated 事件 → restartSentinel() → StartSentinel(dispatch) → StopSentinel(sync) + docker run + heartbeat + broadcast
+12. **创建期静默初始化**：ServerSetting creating 事件自动生成 token 和 URL，用 `saveQuietly()` 不触发 updated 事件，避免刚创建就重启
+13. **字符白名单防注入**：`isValidSentinelToken` 用正则 `[a-zA-Z0-9._\-+=\/]` 限制 token 字符集，拼 shell 命令时无注入风险
+14. **isFunctional 的 ssh-mux 清理**：服务器不可操作时删除多路复用控制文件，防止僵死连接
+15. **快速失败部署**：服务器不可用时部署任务立即失败，不阻塞队列
+16. **队列容量限制**：每服务器 `deployment_queue_limit`（默认 25）防堆积
+17. **空容器列表保护**：PushServerUpdateJob 中容器列表为空时不标记资源 exited，防误判
+18. **最终清理**：7 天不可达服务器自动禁用，防止永远重试已离线服务器
+19. **云端付费校验**：Sentinel push 在云环境校验订阅付费状态，未付费返回 401
