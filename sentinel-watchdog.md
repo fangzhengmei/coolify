@@ -79,7 +79,20 @@
 
 ## 三、段 2：状态轮询 — ServerCheckJob + PushServerUpdateJob
 
-状态轮询有两条路径，取决于 Sentinel 是否启用且心跳存活。
+状态轮询有**两条平行实现**，各自覆盖不同的服务器类型和运行场景。
+
+### 两条路径的关系
+
+| | SSH 主动轮询 (ServerCheckJob) | Sentinel 推送轮询 (PushServerUpdateJob) |
+|---|---|---|
+| 触发方式 | ServerManagerJob 定时派发 | Sentinel 容器 HTTP POST 回调 |
+| 适用服务器 | 所有非 Swarm 非 Build 服务器 | 所有非 Swarm 非 Build 服务器 |
+| Swarm 支持 | ✅ 支持 (`isSwarmWorker` 跳过, `isSwarmManager` 正常) | ❌ 不支持 (PushServerUpdateJob 注释: `TODO: Swarm is not supported yet`) |
+| 数据源 | `docker container inspect` (SSH) | Sentinel 容器内采集 |
+| 生效条件 | `sentinelOutOfSync == true` | `sentinelOutOfSync == false` (心跳正常) |
+| 容器状态更新 | `GetContainersStatus::run()` | 直接在 Job 内遍历容器列表 |
+
+**核心区别**：这两条路径是互斥的——当 Sentinel 心跳正常时走推送路径，心跳失同步时退回 SSH 路径。Swarm 服务器只能走 SSH 路径，因为 `PushServerUpdateJob` 尚不支持 Swarm。
 
 ### 路径 A：SSH 主动轮询 — ServerCheckJob
 
@@ -103,9 +116,9 @@ if ($sentinelOutOfSync) {
 
 1. 调用 `server->serverStatus()` → SSH 检查可达性 + 功能性
 2. 如果服务器不在线 → 直接返回（不更新容器状态）
-3. 获取容器列表 (`docker container inspect`)
+3. 非 Swarm Worker 也非 Build Server 时，获取容器列表 (`docker container inspect`)
 4. 调用 `GetContainersStatus::run()` 同步容器状态到数据库
-5. 如果 Sentinel 已启用 → 派发 `CheckAndStartSentinelJob`
+5. 如果 Sentinel 已启用 (`isSentinelEnabled()`) → 派发 `CheckAndStartSentinelJob`
 6. 检查 Log Drain 容器
 7. 检查 Proxy 容器 → 不存在则自动启动
 
@@ -116,10 +129,11 @@ if ($sentinelOutOfSync) {
 [SentinelController::push()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Http/Controllers/Api/SentinelController.php#L24-L108) 处理流程：
 
 1. **Token 验证** → 解密 Bearer Token → 提取 `server_uuid` → 匹配数据库中的服务器
-2. **功能性检查** → `server->isFunctional()` 必须为 true
-3. **Token 一致性** → 请求 token 必须与数据库存储的 `sentinel_token` 一致
-4. **心跳更新** → `server->sentinelHeartbeat()` — **每次推送都更新 `sentinel_updated_at`**
-5. **去重判断** → `shouldDispatchUpdate()` 决定是否派发 `PushServerUpdateJob`
+2. **云端未付费检查** → 云环境下，如果团队未付费 (`stripe_invoice_paid === false`) 且非内部团队 (`team_id !== 0`)，返回 401 Unauthorized
+3. **功能性检查** → `server->isFunctional()` 必须为 true，否则返回 401
+4. **Token 一致性** → 请求 token 必须与数据库存储的 `sentinel_token` 一致
+5. **心跳更新** → `server->sentinelHeartbeat()` — **每次推送都更新 `sentinel_updated_at`**
+6. **去重判断** → `shouldDispatchUpdate()` 决定是否派发 `PushServerUpdateJob`
 
 去重机制 ([shouldDispatchUpdate](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Http/Controllers/Api/SentinelController.php#L116-L141))：
 
@@ -138,11 +152,38 @@ if ($sentinelOutOfSync) {
 7. 标记未找到的资源为 `exited`
 8. 检查 Proxy 和 Log Drain 容器
 
+> **Swarm 不支持**：`PushServerUpdateJob` 开头有 `// TODO: Swarm is not supported yet`，Swarm 集群只能通过 SSH 路径 (ServerCheckJob) 获取容器状态。
+
 ---
 
 ## 四、段 3：自动启动 — CheckAndStartSentinelJob
 
-Sentinel 的自动启动有 **两个触发点**：
+### isSentinelEnabled 的真实含义
+
+[Server::isSentinelEnabled()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/Server.php#L704-L707) **不是** `server_settings.is_sentinel_enabled` 的简单读取，而是一个组合判定：
+
+```php
+public function isSentinelEnabled()
+{
+    return ($this->isMetricsEnabled() || $this->isServerApiEnabled()) && ! $this->isBuildServer();
+}
+```
+
+其中：
+- [isMetricsEnabled()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/Server.php#L709-L712) → `settings.is_metrics_enabled`
+- [isServerApiEnabled()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/Server.php#L714-L717) → `settings.is_sentinel_enabled`
+
+**两者是 OR 关系**：只要「指标采集」或「Sentinel API」任一启用，并且该服务器不是 Build Server，就视为 Sentinel 已启用。`is_sentinel_enabled` 只是 Sentinel 功能的一个子开关（控制 Server API 能力），不是总开关。
+
+同时，[StartSentinel](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Actions/Server/StartSentinel.php#L15-L17) 在 Swarm 服务器上直接返回，不做任何操作：
+
+```php
+if ($server->isSwarm() || $server->isBuildServer()) {
+    return;
+}
+```
+
+### Sentinel 的自动启动有 **三个触发点**：
 
 ### 触发点 1：ServerCheckJob 中触发（崩溃恢复）
 
@@ -170,6 +211,10 @@ if ($shouldRestartSentinel) {
 
 每天零点检查 Sentinel 是否需要更新版本。
 
+### 触发点 3：配置变更触发（热重载）
+
+见第五节场景 5 的完整链路展开。
+
 ### 执行流程
 
 [CheckAndStartSentinelJob](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Jobs/CheckAndStartSentinelJob.php#L14-L51)：
@@ -186,16 +231,18 @@ if ($shouldRestartSentinel) {
 
 [StartSentinel](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Actions/Server/StartSentinel.php#L9-L70)：
 
-1. 如果是重启 → 先 `StopSentinel::run()` (docker rm -f + 重置心跳)
-2. 获取配置：metrics 历史天数、刷新率、推送间隔、token、端点 URL、debug 模式
-3. `ensureValidSentinelToken()` → 确保 token 有效（无效则重新生成）
-4. 构建 `docker run` 命令，配置：
+1. Swarm/Build Server → 直接返回，不启动
+2. 如果是重启 → 先 `StopSentinel::run()` (docker rm -f + 重置心跳)
+3. 获取配置：metrics 历史天数、刷新率、推送间隔、token、端点 URL、debug 模式
+4. `ensureValidSentinelToken()` → 确保 token 有效（无效则重新生成）
+5. 构建 `docker run` 命令，配置：
    - 健康检查：`curl --fail http://127.0.0.1:8888/api/health`（每 10 秒，3 次失败）
    - 挂载 Docker socket 和数据目录
    - `--pid host` 共享 PID 命名空间
-5. 执行远程命令：删除旧容器 → 创建目录 → 启动新容器 → 修复权限
-6. 更新数据库：`is_sentinel_enabled = true` + `sentinelHeartbeat()`
-7. 广播 `SentinelRestarted` 事件（通知前端 UI）
+   - `COLLECTOR_ENABLED` 由 `isMetricsEnabled()` 决定（而非 `is_sentinel_enabled`）
+6. 执行远程命令：删除旧容器 → 创建目录 → 启动新容器 → 修复权限
+7. 更新数据库：`is_sentinel_enabled = true` + `sentinelHeartbeat()`
+8. 广播 `SentinelRestarted` 事件（通知前端 UI）
 
 ---
 
@@ -210,7 +257,7 @@ Sentinel 停止推送
   → sentinel_updated_at 不再更新
   → ServerManagerJob 检测到 sentinelOutOfSync
   → 派发 ServerCheckJob（SSH 轮询）
-  → ServerCheckJob 发现服务器在线 + Sentinel 已启用
+  → ServerCheckJob 发现服务器在线 + isSentinelEnabled()=true
   → 派发 CheckAndStartSentinelJob
   → 检测到容器不在 running 状态
   → StartSentinel::run(restart: true) 重新启动
@@ -249,9 +296,9 @@ Sentinel 心跳存活 → ServerManagerJob 跳过 SSH 连接检查
 
 这是 Sentinel 存在的核心价值——**只要 Sentinel 能推送数据，即使 SSH 连接有问题，系统仍然能正常监控容器状态**。
 
-### 场景 5：配置变更触发 Sentinel 重启
+### 场景 5：配置变更触发 Sentinel 重启（全链路展开）
 
-[ServerSetting::booted()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/ServerSetting.php#L117-L142) 监听以下字段变更：
+[ServerSetting::booted()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/ServerSetting.php#L117-L142) 通过 Eloquent `updated` 事件监听以下 5 个字段的变更：
 
 - `sentinel_token`
 - `sentinel_custom_url`
@@ -259,7 +306,27 @@ Sentinel 心跳存活 → ServerManagerJob 跳过 SSH 连接检查
 - `sentinel_metrics_history_days`
 - `sentinel_push_interval_seconds`
 
-任一变更 → `server->restartSentinel()` → `StartSentinel::dispatch(async: true)`
+**完整调用链**：
+
+```
+ServerSetting 字段变更 → Eloquent updated 事件触发
+  → ServerSetting::booted() 中 wasChanged() 检测
+  → $settings->server->restartSentinel()                [Server::restartSentinel()]
+      → StartSentinel::dispatch($this, true, ...)       [默认 async=true]
+          → StartSentinel::handle($server, restart=true)
+              ├── $server->isSwarm() || $server->isBuildServer() → return
+              ├── StopSentinel::run($server)             [先停]
+              │   ├── docker rm -f coolify-sentinel      [远程执行]
+              │   └── $server->sentinelHeartbeat(isReset=true)  [sentinel_updated_at = now()-6000min]
+              ├── ensureValidSentinelToken()              [确保 token 有效]
+              ├── docker run -d ... coolify-sentinel      [远程启动新容器]
+              ├── $server->settings->is_sentinel_enabled = true + save()
+              ├── $server->sentinelHeartbeat()            [sentinel_updated_at = now()]
+              └── SentinelRestarted::dispatch($server)    [广播 WebSocket 事件]
+                    └── PrivateChannel("team.{teamId}")   [前端 Livewire 收到通知]
+```
+
+注意：`restartSentinel()` 默认 `async=true`，通过队列异步执行 `StartSentinel`；如果 `async=false`，则同步调用 `StartSentinel::run()`。`StopSentinel::run()` 始终是同步的——先停后启，确保端口不冲突。
 
 ---
 
@@ -273,6 +340,13 @@ Sentinel 容器（远程服务器上）
     │  每 push_interval_seconds（默认 60s）HTTP POST
     ▼
 SentinelController::push()
+    │
+    ├── Token 缺失/解密失败/负载无效 → 401
+    ├── 服务器不存在 → 404
+    ├── 云端未付费 (isCloud && !stripe_invoice_paid && team_id !== 0) → 401
+    ├── isFunctional() === false → 401
+    ├── Token 不匹配 → 401
+    ├── 验证 containers 数组 → 422
     │
     ├── server->sentinelHeartbeat()     → 更新 servers.sentinel_updated_at
     │
@@ -324,6 +398,49 @@ return $wait;
 - 正常心跳：`sentinel_updated_at = now()`
 - 重置心跳（StopSentinel 时）：`sentinel_updated_at = now()->subMinutes(6000)` → 确保立即判定为失同步
 
+### isFunctional 与 isSentinelLive 对照
+
+[Server::isFunctional()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/Server.php#L1083-L1092) 和 [Server::isSentinelLive()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/Server.php#L699-L702) 是系统中判定服务器在线状态的两种互补机制：
+
+| 维度 | isFunctional() | isSentinelLive() |
+|------|---------------|-----------------|
+| 判定依据 | `is_reachable` + `is_usable` + `!force_disabled` + `ip !== '1.2.3.4'` | `sentinel_updated_at` 是否在等待阈值内 |
+| 数据来源 | SSH 连接检查 (ServerConnectionCheckJob) 写入的数据库字段 | Sentinel 推送 (SentinelController::push) 更新的时间戳 |
+| 检测方式 | 主动探测（Coolify → SSH → 服务器） | 被动接收（服务器 → HTTP POST → Coolify） |
+| 副作用 | 返回 false 时删除 `ssh-mux` 文件（`Storage::disk('ssh-mux')->delete(muxFilename())`） | 无副作用，纯读操作 |
+| 使用场景 | ApplicationDeploymentJob 是否可执行、Sentinel push 是否接受、资源操作前置检查 | ServerManagerJob 是否跳过 SSH 连接检查、是否跳过 SSH 状态轮询 |
+| 影响范围 | 全局——部署、API、所有资源操作都依赖此判定 | 局部——仅影响 ServerManagerJob 的调度决策 |
+| 失效后果 | 所有部署失败（快速 fail）、SSH 多路复用 socket 被清理 | 回退到 SSH 轮询路径（降级而非中断） |
+| 恢复方式 | ServerConnectionCheckJob 检测到 SSH 可达后设置 is_reachable=true | Sentinel 恢复推送后 sentinel_updated_at 自动刷新 |
+| 适用服务器 | 所有服务器 | 仅 isSentinelEnabled()=true 的服务器 |
+
+**关键区别**：`isFunctional()` 是服务器可操作性的**权威判定**——只要它返回 false，所有需要 SSH 的操作（部署、Sentinel push 接受等）都会被拒绝，并清理 SSH 多路复用文件。`isSentinelLive()` 是一种**优化手段**——仅用于决定是否跳过冗余的 SSH 检查，失效后系统降级运行而非中断。
+
+### isFunctional 的 ssh-mux 清理细节
+
+[Server::isFunctional()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/Server.php#L1083-L1092) 在返回 false 时会主动删除 SSH 多路复用控制文件：
+
+```php
+public function isFunctional()
+{
+    $isFunctional = data_get($this->settings, 'is_reachable')
+        && data_get($this->settings, 'is_usable')
+        && data_get($this->settings, 'force_disabled') === false
+        && $this->ip !== '1.2.3.4';
+
+    if ($isFunctional === false) {
+        Storage::disk('ssh-mux')->delete($this->muxFilename());
+    }
+
+    return $isFunctional;
+}
+```
+
+[muxFilename()](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Models/Server.php#L1027-L1030) 返回 `mux_{server_uuid}`。SSH 多路复用控制文件是一个 Unix socket，用于复用 SSH 连接。当服务器被判定为不可操作时，删除该文件可以：
+- 避免后续 SSH 命令尝试使用已失效的多路复用连接
+- 强制下次连接时建立新的 SSH 会话
+- 防止僵死的多路复用 socket 占用文件描述符
+
 ### 健康记录字段汇总
 
 | 表 | 字段 | 更新者 | 含义 |
@@ -333,7 +450,8 @@ return $wait;
 | servers | unreachable_notification_sent | isReachableChanged() | 是否已发送不可达通知 |
 | server_settings | is_reachable | ServerConnectionCheckJob / validateConnection() | SSH 可达性 |
 | server_settings | is_usable | ServerConnectionCheckJob | Docker 可用性 |
-| server_settings | is_sentinel_enabled | StartSentinel / 用户操作 | Sentinel 功能开关 |
+| server_settings | is_metrics_enabled | 用户操作 | 指标采集开关（影响 isSentinelEnabled 判定） |
+| server_settings | is_sentinel_enabled | StartSentinel / 用户操作 | Sentinel Server API 开关（影响 isSentinelEnabled 判定） |
 
 ---
 
@@ -398,6 +516,7 @@ if ($this->server->isFunctional() === false) {
   │
   ├── Horizon worker 取出任务执行
   │   ├── isFunctional() = false → 立即 fail("Server is not functional")
+  │   │   └── 同时删除 ssh-mux 控制文件 (Storage::disk('ssh-mux')->delete)
   │   └── status 变为 failed，释放队列位
   │
   ├── 后续部署请求继续入队/快速失败循环
@@ -429,13 +548,30 @@ if ($this->server->isFunctional() === false) {
 if ($uptime === false) {
     foreach ($this->applications() as $application) {
         $application->status = 'exited';
+        $application->save();
     }
     foreach ($this->databases() as $database) {
         $database->status = 'exited';
+        $database->save();
     }
-    // ... services 同理
+    foreach ($this->services() as $service) {
+        $apps = $service->applications()->get();
+        $dbs = $service->databases()->get();
+        foreach ($apps as $app) {
+            $app->status = 'exited';
+            $app->save();
+        }
+        foreach ($dbs as $db) {
+            $db->status = 'exited';
+            $db->save();
+        }
+    }
+
+    return false;
 }
 ```
+
+Services 不是整体标记 `exited`，而是逐个遍历其 `applications()` 和 `databases()` 子资源分别标记。这是因为 Service 本身没有 `status` 字段——它的"状态"由子资源的状态聚合而来。
 
 而 `PushServerUpdateJob` 中的 [updateNotFoundApplicationStatus](file:///d:/fz/0601-1/solo-dogfeeding/code/98-coolify/app/Jobs/PushServerUpdateJob.php#L612-L629) 等方法有额外的安全保护：
 
@@ -483,12 +619,12 @@ if ($this->containers->isEmpty()) {
              │     │                         │
              │     │                         ├── serverStatus() 失败 → 返回
              │     │                         ├── 获取容器列表 + 同步状态
-             │     │                         ├── Sentinel 启用? → dispatch CheckAndStartSentinelJob
+             │     │                         ├── isSentinelEnabled()? → dispatch CheckAndStartSentinelJob
              │     │                         └── 检查 Proxy/Log Drain
              │     │
              │     └── NO → Sentinel 推送已覆盖状态同步，无需 SSH
              │
-             ├── 每日零点 + Sentinel 启用? → dispatch CheckAndStartSentinelJob
+             ├── 每日零点 + isSentinelEnabled()? → dispatch CheckAndStartSentinelJob
              │                                      （版本更新检查）
              │
              └── sentinelOutOfSync? ──→ dispatch ServerStorageCheckJob
@@ -499,6 +635,12 @@ if ($this->containers->isEmpty()) {
   └── Sentinel 容器（远程服务器上）
         │
         └── 每 push_interval_seconds → HTTP POST → SentinelController::push()
+              │
+              ├── Token 缺失/无效 → 401
+              ├── 云端未付费 → 401
+              ├── isFunctional()=false → 401
+              ├── Token 不匹配 → 401
+              ├── containers 校验失败 → 422
               │
               ├── sentinelHeartbeat() → 更新 sentinel_updated_at
               │
@@ -517,12 +659,15 @@ if ($this->containers->isEmpty()) {
 ## 九、关键设计要点总结
 
 1. **心跳驱动的 SSH 短路**：Sentinel 心跳存活时跳过 SSH 连接检查，大幅减少 SSH 连接数
-2. **双重状态轮询**：Sentinel 推送（轻量、高频）+ SSH 轮询（重量、低频、仅失同步时）
-3. **去重推送**：容器状态 hash + 强制窗口，避免每分钟执行重量级数据库操作
-4. **退避策略**：不可达次数越多检查越稀疏，使用哈希分散避免惊群
-5. **崩溃自愈**：Sentinel 失同步 → SSH 轮询 → 发现 Sentinel 挂 → 自动重启
-6. **配置热重载**：Sentinel 相关设置变更自动触发重启
-7. **快速失败部署**：服务器不可用时部署任务立即失败，不阻塞队列
-8. **队列容量限制**：每服务器 `deployment_queue_limit`（默认 25）防堆积
-9. **空容器列表保护**：PushServerUpdateJob 中容器列表为空时不标记资源 exited，防误判
-10. **最终清理**：7 天不可达服务器自动禁用，防止永远重试已离线服务器
+2. **双重状态轮询（互斥）**：Sentinel 推送（轻量、高频）+ SSH 轮询（重量、低频、仅失同步时），二者互斥，Swarm 仅支持 SSH 路径
+3. **isSentinelEnabled 是 OR 组合**：`isMetricsEnabled() || isServerApiEnabled()`，`is_sentinel_enabled` 只是子开关而非总开关
+4. **去重推送**：容器状态 hash + 强制窗口，避免每分钟执行重量级数据库操作
+5. **退避策略**：不可达次数越多检查越稀疏，使用哈希分散避免惊群
+6. **崩溃自愈**：Sentinel 失同步 → SSH 轮询 → 发现 Sentinel 挂 → 自动重启
+7. **配置热重载全链**：ServerSetting updated 事件 → restartSentinel() → StartSentinel(dispatch) → StopSentinel(sync) + docker run + heartbeat + broadcast
+8. **isFunctional 的 ssh-mux 清理**：服务器不可操作时删除多路复用控制文件，防止僵死连接
+9. **快速失败部署**：服务器不可用时部署任务立即失败，不阻塞队列
+10. **队列容量限制**：每服务器 `deployment_queue_limit`（默认 25）防堆积
+11. **空容器列表保护**：PushServerUpdateJob 中容器列表为空时不标记资源 exited，防误判
+12. **最终清理**：7 天不可达服务器自动禁用，防止永远重试已离线服务器
+13. **云端付费校验**：Sentinel push 在云环境校验订阅付费状态，未付费返回 401
