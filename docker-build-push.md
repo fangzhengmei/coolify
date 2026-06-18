@@ -324,36 +324,82 @@ public $timeout = 3600;      // 最长执行 1 小时
 | SSH 协议 | `kex_exchange_identification`、`ssh_exchange_identification`、`Host key verification failed` |
 | 资源不足 | `No buffer space available`、`Cannot assign requested address` |
 
-#### 指数退避算法
+#### 指数退避算法与默认配置
 
-`calculateRetryDelay()` [SshRetryable.php L58-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Traits/SshRetryable.php#L58-L68)：
+`calculateRetryDelay()` [SshRetryable.php L59-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Traits/SshRetryable.php#L59-L68)：
 
-```
-delay = min(baseDelay * (multiplier ^ attempt), maxDelay)
-
-默认值 (config/constants.php):
-  baseDelay = 1s
-  multiplier = 2
-  maxDelay = 30s
-  maxRetries = 5 次
-
-重试序列: 1s → 2s → 4s → 8s → 16s (第 5 次失败后放弃)
+```php
+$delay = min($baseDelay * pow($multiplier, $attempt), $maxDelay);
 ```
 
-#### 重试执行流程
+默认值在 [constants.php L81-L84](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/config/constants.php#L81-L84)：
 
-`execute_remote_command()` [ExecuteRemoteCommand.php L61-L151](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Traits/ExecuteRemoteCommand.php#L61-L151) 内嵌 while 循环：
+```php
+'max_retries' => env('SSH_MAX_RETRIES', 3),           // 默认 3 次总尝试
+'retry_base_delay' => env('SSH_RETRY_BASE_DELAY', 2), // 默认 2s
+'retry_max_delay' => env('SSH_RETRY_MAX_DELAY', 30),  // 默认 30s
+'retry_multiplier' => env('SSH_RETRY_MULTIPLIER', 2), // 默认 2 倍
+```
+
+#### 两个独立的重试入口
+
+代码中有 **两个独立的重试实现**，行为一致但入口不同：
+
+| 入口 | 所在 Trait | 适用场景 |
+|------|-----------|---------|
+| `executeWithSshRetry()` | [SshRetryable.php L78-L133](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Traits/SshRetryable.php#L78-L133) | 通用回调包装，供其他 Job 使用 |
+| `execute_remote_command()` | [ExecuteRemoteCommand.php L61-L151](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Traits/ExecuteRemoteCommand.php#L61-L151) | 部署过程中的 SSH 命令执行 |
+
+#### 最大尝试次数与重试序列（默认 `max_retries = 3`）
+
+`max_retries = 3` 表示 **总共执行 3 次命令**（初始 1 次 + 重试 2 次），而非"最多重试 3 次"。
+
+**完整时序（默认配置）**：
+```
+尝试 1 (第 0 次循环)
+   ↓ 失败，检查：isRetryable && attempt < 2 (3-1)
+   ↓ 计算 delay: attempt=0 → 2 * 2^0 = 2s
+   ↓ sleep(2s)
+尝试 2 (第 1 次循环)
+   ↓ 失败，检查：isRetryable && attempt < 2
+   ↓ 计算 delay: attempt=1 → 2 * 2^1 = 4s
+   ↓ sleep(4s)
+尝试 3 (第 2 次循环)
+   ↓ 失败，检查：attempt < 2? → 2 < 2? → false
+   ↓ 放弃，抛出异常
+```
+
+| 失败顺序 | attempt 值 | 等待时间 | 累计等待 |
+|---------|-----------|---------|---------|
+| 第 1 次失败 | 0 | 2s | 2s |
+| 第 2 次失败 | 1 | 4s | 6s |
+| 第 3 次失败 | 2 | - | 放弃 |
+
+#### 放弃条件
+
+满足以下任一条件即停止重试，直接抛出异常：
+
+1. **错误不可重试**：`!isRetryableSshError()` — 错误信息不在 40+ 种可重试模式列表中
+2. **已达最后一次尝试**：`$attempt >= $maxRetries - 1` — 默认 attempt >= 2 即最后一次
+3. **异常类型不匹配**（仅 `execute_remote_command`）：捕获范围仅限 `RuntimeException` 和 `DeploymentException`，其他异常直接向上抛出
+4. **用户主动取消**（仅 `execute_remote_command`）：每次重试前检查部署队列状态，若为 `CANCELLED_BY_USER` 则抛出 69420 中断码
+
+#### 重试执行流程（`execute_remote_command`）
+
+[ExecuteRemoteCommand.php L104-L133](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Traits/ExecuteRemoteCommand.php#L104-L133) 内嵌 while 循环：
 
 ```
-for attempt = 0; attempt < maxRetries; attempt++:
+while attempt < maxRetries && !commandExecuted:
   try:
     executeCommandWithProcess()  # 通过 SSH 多路复用执行
-    break                        # 成功跳出
-  catch RuntimeException:
+    commandExecuted = true       # 成功跳出
+  catch RuntimeException|DeploymentException:
     if isRetryableSshError() && attempt < maxRetries - 1:
+      attempt++
+      delay = calculateRetryDelay(attempt - 1)
       addRetryLogEntry()         # 写入部署日志
+      检查用户取消 → 抛 69420 中断
       sleep(delay)               # 指数退避等待
-      期间检查用户取消 → 抛 69420 中断
     else:
       throw e                    # 非重试错误或已达上限
 ```
@@ -465,4 +511,6 @@ ApplicationDeploymentJob::handle()
 | 缓存粒度 | SHA-commit 检查 + 配置 diff + BuildKit 层 | 三层过滤，优先跳过整个 build 过程而非仅复用层 |
 | 重试粒度 | SSH 命令级，不超过 Job 级 | 网络瞬态问题自动恢复，避免脏状态的重复部署 |
 | 环境变量传递 | `source .env` + `--build-arg KEY`（键名） + `--secret`（敏感值） | 兼顾 shell 插值、Docker 缓存、Secret 安全三类需求 |
-| forceFail 策略 | 跨节点场景必失败，单机场景可容忍 | 单机镜像已本地存在，registry 失败不应影响业务可用性 |
+| forceFail 策略 | 所有需推送 registry 的场景均必失败 | 代码默认 `$forceFail = true`，无分支将其设为 false，确保部署状态一致性 |
+| 容器清理策略 | 69420 错误码保留新容器，其余错误按条件回滚 | registry 推送失败时新容器可能已正常运行，不应误删；一致容器名/PR 部署避免冲突 |
+| SSH 重试策略 | 命令级 3 次尝试 + 指数退避 2s→4s→8s | 网络瞬态问题自动恢复，同时避免无限重试导致 Job 超时（Job 总超时 3600s） |
