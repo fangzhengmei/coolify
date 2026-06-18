@@ -234,18 +234,65 @@ Step 3: 若配置了 docker_registry_image_tag + 非 PR 部署
         → docker push {reg}:{user_tag}
 ```
 
-#### `forceFail` 标志位行为
+#### 推送失败是否中断部署？
 
-在以下场景中，推送失败将**直接终止部署**并抛出异常（`DeploymentException`，错误码 69420 有特殊语义）：
+**结论：所有需要推送 registry 的场景，推送失败都会中断部署。**
 
-| 场景 | forceFail | 原因 |
-|------|-----------|------|
-| 使用独立构建服务器 | `true` | 目标服务器需从 registry 拉取，推送失败则无法部署 |
-| Swarm 集群部署 | `true` | Swarm 节点需要从 registry 拉取镜像 |
-| 存在 additional_servers | `true` | 附加服务器需要 registry 镜像 |
-| 单机部署，无附加服务器 | `false` | 镜像已在本地，推送失败不影响部署 |
+从 [push_to_docker_registry() L1078-L1131](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Jobs/ApplicationDeploymentJob.php#L1078-L1131) 代码看：
 
-> 错误码 `69420` 在 `failed()` [L4879-L4892](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Jobs/ApplicationDeploymentJob.php#L4879-L4892) 中有特殊含义：不会删除新启动的容器，因为 registry 推送失败时新容器可能已经在正常运行。
+```php
+$forceFail = true;       // 默认值就是 true
+if ($this->use_build_server) {
+    $forceFail = true;   // 再次确认 true
+}
+if ($this->server->isSwarm() && $this->build_pack !== 'dockerimage') {
+    $forceFail = true;   // 再次确认 true
+}
+if ($this->application->additional_servers->count() > 0) {
+    $forceFail = true;   // 再次确认 true
+}
+// ... 没有任何地方把 $forceFail 设为 false
+```
+
+**推送异常处理逻辑：**
+1. 捕获 `Exception` → 输出日志
+2. 检查 `$forceFail`（始终为 `true`）→ 抛出 `DeploymentException`
+3. 触发 `failed()` 方法进行失败清理
+
+| 场景 | forceFail | 是否中断部署 | 原因 |
+|------|-----------|-------------|------|
+| 使用独立构建服务器 | `true` | ✅ 中断 | 目标服务器需从 registry 拉取，推送失败则无法部署 |
+| Swarm 集群部署 | `true` | ✅ 中断 | Swarm 节点需要从 registry 拉取镜像 |
+| 存在 additional_servers | `true` | ✅ 中断 | 附加服务器需要 registry 镜像 |
+| 单机部署，无附加服务器 | `true` | ✅ 中断 | 代码未区分，同样中断 |
+
+#### 错误码 69420 的特殊语义
+
+错误码 `69420` 在 [failed() L4879-L4892](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Jobs/ApplicationDeploymentJob.php#L4879-L4892) 中有特殊含义：
+- 含义：registry 推送失败
+- 行为：**不删除**新启动的容器
+- 理由：推送失败发生在 `rolling_update()` 之后，此时新容器可能已经在正常运行，不应因 registry 问题中断业务
+
+### 3.3 失败清理逻辑
+
+部署异常时，`failed(Throwable $exception)` 按以下顺序执行：
+
+1. **标记失败**：调用 `failDeployment()` [L4838-L4841](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Jobs/ApplicationDeploymentJob.php#L4838-L4841) → 状态转为 `FAILED`
+2. **详细日志**：写入错误类型、错误码、异常文件+行号、异常链（previous）、堆栈前 5 行
+3. **容器清理**（仅 `build_pack !== 'dockercompose'` 时）：
+   - 如果错误码 **≠ 69420**：
+     - 若启用了 `is_consistent_container_name_enabled`、或有 `custom_internal_name`、或 `PR 部署` → **不删除**新容器
+     - 否则 → `docker rm -f ${container_name}` 删除新容器
+   - 如果错误码 **= 69420**（registry 推送失败）→ **不删除**新容器
+
+```
+容器清理决策树:
+  错误码 == 69420?
+    ├─ 是 → 保留新容器 (推送失败不影响已运行容器)
+    └─ 否 → 检查一致容器名/自定义名/PR 部署
+           ├─ 是 → 保留新容器 (避免重复名称冲突/PR 环境保留)
+           └─ 否 → docker rm -f 删除新容器 (回滚)
+```
 
 ---
 
