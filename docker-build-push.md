@@ -421,11 +421,13 @@ while ($attempt < $maxRetries && !$commandExecuted) {
 
 | 执行次数 | 失败后等待 | 计算依据 | 日志显示 | 累计等待 |
 |---------|-----------|---------|----------|---------|
-| 第 1 次失败 | 2s | `2 × 2⁰ = 2s | Attempt 1/3, waiting 2s | 2s |
+| 第 1 次失败 | 2s | `2 × 2⁰ = 2s` | Attempt 1/3, waiting 2s | 2s |
 | 第 2 次失败 | 4s | `2 × 2¹ = 4s` | Attempt 2/3, waiting 4s | 6s |
-| 第 3 次失败 | - | -（放弃，不等待 | - | - |
+| 第 3 次失败 | - | 放弃，不等待 | - | - |
 
-#### 放弃条件（满足任一即停止重试、直接抛出异常：
+#### 放弃条件
+
+满足任一即停止重试、直接抛出异常：
 
 1. **错误不可重试**：`!isRetryableSshError()` — 错误信息不在 40+ 种可重试模式列表中
 2. **已达最后一次尝试**：`$attempt >= $maxRetries - 1` — 默认 attempt >= 2 即最后一次
@@ -501,7 +503,7 @@ ApplicationDeploymentJob::handle()
   │     │     │
   │     │     ├─► build_image()
   │     │     │     ├─ BuildKit 命令拼接 (含 --no-cache 分支)
-  │     │     │     └─ execute_remote_command() [SSH 自动重试 ×5]
+  │     │     │     └─ execute_remote_command() [SSH 自动重试 ×3]
   │     │     │
   │     │     ├─► push_to_docker_registry()
   │     │     │     ├─ 条件检查 (forceFail 决策)
