@@ -350,59 +350,87 @@ $delay = min($baseDelay * pow($multiplier, $attempt), $maxDelay);
 | `executeWithSshRetry()` | [SshRetryable.php L78-L133](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Traits/SshRetryable.php#L78-L133) | 通用回调包装，供其他 Job 使用 |
 | `execute_remote_command()` | [ExecuteRemoteCommand.php L61-L151](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Traits/ExecuteRemoteCommand.php#L61-L151) | 部署过程中的 SSH 命令执行 |
 
-#### 最大尝试次数与重试序列（默认 `max_retries = 3`）
+#### 最大尝试次数与等待序列（默认 `max_retries = 3`）
 
 `max_retries = 3` 表示 **总共执行 3 次命令**（初始 1 次 + 重试 2 次），而非"最多重试 3 次"。
 
-**完整时序（默认配置）**：
+两个重试入口的循环控制略有差异，但最终等待序列完全一致。
+
+##### 入口 A：`executeWithSshRetry()` [SshRetryable.php L88-L111](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Traits/SshRetryable.php#L88-L111)
+
+```php
+for ($attempt = 0; $attempt < $maxRetries; $attempt++) {
+    try {
+        return $callback();
+    } catch (\Throwable $e) {
+        if ($this->isRetryableSshError($e->getMessage()) && $attempt < $maxRetries - 1) {
+            $delay = $this->calculateRetryDelay($attempt);  // 用当前 attempt 计算
+            $this->addRetryLogEntry($attempt + 1, $maxRetries, $delay, ...); // 日志显示第几次
+            sleep($delay);
+            continue;
+        }
+        break;
+    }
+}
 ```
-尝试 1 (第 0 次循环)
-   ↓ 失败，检查：isRetryable && attempt < 2 (3-1)
-   ↓ 计算 delay: attempt=0 → 2 * 2^0 = 2s
+
+##### 入口 B：`execute_remote_command()` [ExecuteRemoteCommand.php L104-L133](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Traits/ExecuteRemoteCommand.php#L104-L133)
+
+```php
+$attempt = 0;
+while ($attempt < $maxRetries && !$commandExecuted) {
+    try {
+        $this->executeCommandWithProcess(...);
+        $commandExecuted = true;
+    } catch (\RuntimeException|DeploymentException $e) {
+        if ($this->isRetryableSshError($e->getMessage()) && $attempt < $maxRetries - 1) {
+            $attempt++;                                              // 先自增
+            $delay = $this->calculateRetryDelay($attempt - 1);       // 再用 attempt-1 计算
+            $this->addRetryLogEntry($attempt, $maxRetries, $delay, ...); // 日志显示第几次
+            sleep($delay);
+        } else {
+            throw $e;
+        }
+    }
+}
+```
+
+##### 完整等待序列（默认配置，两次失败）
+
+两个入口最终产生完全一致的等待时间（日志均显示 `Attempt N/3`）：
+
+```
+第 1 次执行
+   ↓ 失败
+   ├─ 入口 A: attempt=0, calculateRetryDelay(0) = 2 * 2^0 = 2s
+   ├─ 入口 B: attempt 先变成 1, calculateRetryDelay(0) = 2 * 2^0 = 2s
+   ├─ 日志: "Attempt 1/3, waiting 2s"
    ↓ sleep(2s)
-尝试 2 (第 1 次循环)
-   ↓ 失败，检查：isRetryable && attempt < 2
-   ↓ 计算 delay: attempt=1 → 2 * 2^1 = 4s
+第 2 次执行
+   ↓ 失败
+   ├─ 入口 A: attempt=1, calculateRetryDelay(1) = 2 * 2^1 = 4s
+   ├─ 入口 B: attempt 先变成 2, calculateRetryDelay(1) = 2 * 2^1 = 4s
+   ├─ 日志: "Attempt 2/3, waiting 4s"
    ↓ sleep(4s)
-尝试 3 (第 2 次循环)
-   ↓ 失败，检查：attempt < 2? → 2 < 2? → false
-   ↓ 放弃，抛出异常
+第 3 次执行
+   ↓ 失败
+   ├─ 检查 $attempt < 2? → false (入口A attempt=2, 入口B attempt=2)
+   ├─ 不再等待，直接抛出异常
+   ↓ 放弃
 ```
 
-| 失败顺序 | attempt 值 | 等待时间 | 累计等待 |
-|---------|-----------|---------|---------|
-| 第 1 次失败 | 0 | 2s | 2s |
-| 第 2 次失败 | 1 | 4s | 6s |
-| 第 3 次失败 | 2 | - | 放弃 |
+| 执行次数 | 失败后等待 | 计算依据 | 日志显示 | 累计等待 |
+|---------|-----------|---------|----------|---------|
+| 第 1 次失败 | 2s | `2 × 2⁰ = 2s | Attempt 1/3, waiting 2s | 2s |
+| 第 2 次失败 | 4s | `2 × 2¹ = 4s` | Attempt 2/3, waiting 4s | 6s |
+| 第 3 次失败 | - | -（放弃，不等待 | - | - |
 
-#### 放弃条件
-
-满足以下任一条件即停止重试，直接抛出异常：
+#### 放弃条件（满足任一即停止重试、直接抛出异常：
 
 1. **错误不可重试**：`!isRetryableSshError()` — 错误信息不在 40+ 种可重试模式列表中
 2. **已达最后一次尝试**：`$attempt >= $maxRetries - 1` — 默认 attempt >= 2 即最后一次
 3. **异常类型不匹配**（仅 `execute_remote_command`）：捕获范围仅限 `RuntimeException` 和 `DeploymentException`，其他异常直接向上抛出
 4. **用户主动取消**（仅 `execute_remote_command`）：每次重试前检查部署队列状态，若为 `CANCELLED_BY_USER` 则抛出 69420 中断码
-
-#### 重试执行流程（`execute_remote_command`）
-
-[ExecuteRemoteCommand.php L104-L133](file:///d:/fz/0601-2/solo-dogfeeding/code/40-coolify/app/Traits/ExecuteRemoteCommand.php#L104-L133) 内嵌 while 循环：
-
-```
-while attempt < maxRetries && !commandExecuted:
-  try:
-    executeCommandWithProcess()  # 通过 SSH 多路复用执行
-    commandExecuted = true       # 成功跳出
-  catch RuntimeException|DeploymentException:
-    if isRetryableSshError() && attempt < maxRetries - 1:
-      attempt++
-      delay = calculateRetryDelay(attempt - 1)
-      addRetryLogEntry()         # 写入部署日志
-      检查用户取消 → 抛 69420 中断
-      sleep(delay)               # 指数退避等待
-    else:
-      throw e                    # 非重试错误或已达上限
-```
 
 ### 4.3 健康检查重试（非 SSH 错误）
 
